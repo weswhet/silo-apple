@@ -834,7 +834,8 @@ class PlayerViewModel {
 
     #if os(tvOS)
     enum TVHUDEntryPoint: Equatable {
-        case settings
+        /// Down with the controls hidden: the menu opens on Info.
+        case info
     }
 
     var requestedTVHUDEntryPoint: TVHUDEntryPoint?
@@ -9768,8 +9769,8 @@ class PlayerViewModel {
     }
 
     #if os(tvOS)
-    func openSettingsHUD() {
-        requestedTVHUDEntryPoint = .settings
+    func openInfoHUD() {
+        requestedTVHUDEntryPoint = .info
         openHUD()
     }
 
