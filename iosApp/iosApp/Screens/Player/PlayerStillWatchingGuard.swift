@@ -16,6 +16,10 @@ struct PlayerStillWatchingGuard {
         consecutiveAutoAdvances = 0
     }
 
+    func canAutoAdvance(enabled: Bool, threshold: Int) -> Bool {
+        enabled && !shouldGate(threshold: threshold)
+    }
+
     func shouldGate(threshold: Int) -> Bool {
         threshold > 0 && consecutiveAutoAdvances >= threshold
     }

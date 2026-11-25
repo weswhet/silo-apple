@@ -722,6 +722,10 @@ class PlayerViewModel {
     /// offers the server's pick instead of the series' next episode, and
     /// every pick plays from its beginning.
     private(set) var shuffleState: PlayerShuffleState?
+    private var playlistContext: PlaylistPlaybackContext?
+    private(set) var playlistAwaitingAdvance = false
+    var isPlaylistPlayback: Bool { playlistContext != nil }
+    private var playlistAdvanceTask: Task<Void, Never>?
     /// Stop shuffling clears `shuffleState` before the player closes; the
     /// close still returns to the page the shuffle started from.
     private var stoppedShuffling = false
@@ -1571,6 +1575,7 @@ class PlayerViewModel {
     private var refreshHomeAfterPlaybackWrite: (@MainActor () -> Void)?
     #endif
     var nextUpCarouselItems: [PlayerOnDeckItem] {
+        guard playlistContext == nil else { return [] }
         let hiddenIds = Set([lastLoadRequest?.contentId, nextUpEpisode?.contentId].compactMap { $0 })
         return nextUpOnDeckItems.filter { !hiddenIds.contains($0.contentId) }
     }
@@ -1583,7 +1588,7 @@ class PlayerViewModel {
     }
 
     /// Play Now has been pressed and the next item is not on screen yet.
-    var isStartingNextUp: Bool { isNextUpTransitioning || isAdvancingShuffle }
+    var isStartingNextUp: Bool { isNextUpTransitioning || isAdvancingShuffle || playlistAdvanceTask != nil }
 
     var canPickAnotherShufflePick: Bool {
         shuffleState?.canPickAnother == true && !isStartingNextUp
@@ -3645,6 +3650,7 @@ class PlayerViewModel {
     }
 
     private func loadNextUpCandidate(for detail: WatchDetail) {
+        guard playlistContext == nil else { return }
         guard !isWatchPartyPlayback else { return }
         nextUpLookupTask?.cancel()
         nextUpLookupTask = nil
@@ -3710,6 +3716,7 @@ class PlayerViewModel {
     }
 
     private func loadNextUpOnDeckItems(for detail: WatchDetail) {
+        guard playlistContext == nil else { return }
         guard !isWatchPartyPlayback else { return }
         nextUpOnDeckTask?.cancel()
         nextUpOnDeckTask = nil
@@ -3759,6 +3766,7 @@ class PlayerViewModel {
         #else
         guard !isWatchPartyPlayback,
               shuffleState == nil,
+              playlistContext == nil,
               nextUpEpisode == nil,
               !isLoadingNextUpEpisode,
               nextUpLookupError == nil,
@@ -3985,7 +3993,7 @@ class PlayerViewModel {
 
     private func shouldShowNextUpBeforeEnd(at movieTime: Double) -> Bool {
         canShowNextUpScreen
-            && nextShufflePart == nil
+            && nextQueuePart == nil
             && PlayerNextUpCompletionPolicy.isInPromptWindow(
                 currentTime: movieTime,
                 duration: duration,
@@ -4178,6 +4186,11 @@ class PlayerViewModel {
     }
 
     func playNextEpisodeNow(unattended: Bool = false) {
+        if playlistContext != nil {
+            if !unattended { stillWatchingGuard.recordViewerAction() }
+            advancePlaylist(unattended: unattended)
+            return
+        }
         guard !isWatchPartyPlayback else { return }
         // Play Now counts even when it lands on an advance already in flight.
         if !unattended { stillWatchingGuard.recordViewerAction() }
@@ -4230,6 +4243,62 @@ class PlayerViewModel {
             finalizeCurrentSession: true,
             origin: .autoplay
         )
+    }
+
+    /// Resolve immediately before each load. Entry IDs, not content IDs, keep
+    /// repeated titles distinct and let the server skip newly restricted media.
+    private func advancePlaylist(unattended: Bool = false) {
+        guard let context = playlistContext, playlistAdvanceTask == nil else { return }
+        nextUpStartError = nil
+        playlistAdvanceTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.playlistAdvanceTask = nil }
+            do {
+                let entry = try await SiloAPI.shared.resolvePlaylist(context, after: true)
+                guard !Task.isCancelled, !self.isDisposed,
+                      self.playlistContext?.entryId == context.entryId else { return }
+                guard let entry else {
+                    self.playlistAwaitingAdvance = false
+                    self.beginNextUpPostroll(videoEnded: true)
+                    return
+                }
+                if unattended, !self.stillWatchingGuard.canAutoAdvance(
+                    enabled: self.settings.autoPlayNextEpisode, threshold: self.settings.stillWatchingThreshold
+                ) {
+                    self.playlistAwaitingAdvance = true
+                    self.beginNextUpPostroll(videoEnded: true)
+                    return
+                }
+                self.playlistAwaitingAdvance = false
+                if unattended { self.stillWatchingGuard.recordAutoAdvance() }
+                guard let contentId = entry.itemId else { throw HTTPError.invalidResponse }
+                self.playlistContext?.entryId = entry.id
+                var request = LoadRequest(contentId: contentId, preferredFileId: nil,
+                    preferredAudioTrackIndex: nil, preferredSubtitleTrackIndex: nil,
+                    preferredSidecarSubtitleTrackId: nil, startFromBeginning: true)
+                request.startsAtFirstPart = true
+                self.beginFreshLoad(request: request,
+                    progressPosition: self.completionProgressPositionForCurrentItem(),
+                    finalizeCurrentSession: true, origin: .autoplay)
+            } catch {
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                self.playlistAwaitingAdvance = true
+                self.beginNextUpPostroll(videoEnded: true)
+                self.nextUpStartError = error.localizedDescription
+            }
+        }
+    }
+
+    nonisolated static func isUnavailablePlaylistItem(_ error: Error) -> Bool {
+        if let failure = error as? PlaybackV3TerminalFailure {
+            return failure.reason == "source_unavailable" || failure.reason == "source_unreadable"
+        }
+        switch error {
+        case APIv2Error.problem(let problem): return problem.status == 403 || problem.status == 404
+        case APIv2Error.httpStatus(let status): return status == 403 || status == 404
+        case HTTPError.http(let status, _): return status == 403 || status == 404
+        default: return false
+        }
     }
 
     /// A quality the viewer picked in the player (or SiloRemote picked for
@@ -4482,16 +4551,17 @@ class PlayerViewModel {
         isPickingAnotherShufflePick = false
     }
 
-    /// During a shuffle, the part of a multi-part item that plays after the
-    /// one on screen.
-    private var nextShufflePart: FileVersion? {
-        guard shuffleState != nil,
-              let current = currentSelectedVersion,
-              let versions = currentWatchDetail?.versions else { return nil }
-        return PlayerMultipartPolicy.nextPart(after: current, in: versions)
+    private var queueContinuation: PlayerQueueContinuation {
+        PlayerQueueContinuation.resolve(isPlaylist: playlistContext != nil, isShuffle: shuffleState != nil,
+            current: currentSelectedVersion, versions: currentWatchDetail?.versions ?? [])
     }
 
-    private func playShufflePart(_ part: FileVersion) {
+    private var nextQueuePart: FileVersion? {
+        if case .part(let part) = queueContinuation { return part }
+        return nil
+    }
+
+    private func playQueuePart(_ part: FileVersion) {
         guard let contentId = lastLoadRequest?.contentId else { return }
         var request = LoadRequest(
             contentId: contentId,
@@ -4548,9 +4618,8 @@ class PlayerViewModel {
     /// The Series episode on screen as the player closes, so its Series page
     /// can land on it or on the episode after it. See `SeriesPlaybackReturn`.
     private func seriesPlaybackReturn(completed: Bool) -> SeriesPlaybackReturn? {
-        // A shuffle returns to the page it started from, not to the series of
-        // whichever episode played last.
-        guard shuffleState == nil, !stoppedShuffling else { return nil }
+        // Queues return to their starting page, not the last episode's series.
+        guard shuffleState == nil, !stoppedShuffling, playlistContext == nil else { return nil }
         if let detail = currentWatchDetail {
             guard let seriesId = detail.seriesId?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !seriesId.isEmpty else { return nil }
@@ -5782,9 +5851,17 @@ class PlayerViewModel {
             )
         }
 
-        if !isPremature, let nextPart = nextShufflePart {
-            playShufflePart(nextPart)
-            return
+        if !isPremature {
+            switch queueContinuation {
+            case .part(let part):
+                playQueuePart(part)
+                return
+            case .playlistEntry:
+                advancePlaylist(unattended: true)
+                return
+            case .postroll:
+                break
+            }
         }
         beginNextUpPostroll(videoEnded: true)
 
@@ -6761,6 +6838,11 @@ class PlayerViewModel {
     /// from On Deck or hit Back without the player being taken hostage by an
     /// `error` overlay.
     private func handleBeginFreshLoadFailure(error: Error, origin: LoadOrigin) {
+        if playlistContext != nil, Self.isUnavailablePlaylistItem(error) {
+            isNextUpTransitioning = false
+            advancePlaylist(unattended: origin == .autoplay)
+            return
+        }
         watchPartyAdapter?.onFailure?((error as? PlaybackV3TerminalFailure)?.reason, error.localizedDescription)
         isNextUpTransitioning = false
         // `diagnosticMessage` is English, for the failure token and the logs
@@ -7307,12 +7389,14 @@ class PlayerViewModel {
         prefersLastUsedVersion: Bool = false,
         offlineDownloadId: String? = nil,
         shuffle: APIv2Shuffle? = nil,
+        playlist: PlaylistPlaybackContext? = nil,
         finalizeCurrentSession: Bool = false
     ) {
         guard !isWatchPartyPlayback else { return }
         if let shuffle {
             shuffleState = PlayerShuffleState(shuffle: shuffle)
         }
+        if let playlist { playlistContext = playlist }
         // Another version of the title playing now is a quality change the
         // viewer chose. Detail pages send the file they show on every Play,
         // so only a pinned one is a choice.
@@ -7333,7 +7417,7 @@ class PlayerViewModel {
         request.libraryId = initialLibraryId
         request.prefersLastUsedVersion = prefersLastUsedVersion
         request.pinsVersion = pinsVersion
-        request.startsAtFirstPart = shuffleState != nil
+        request.startsAtFirstPart = shuffleState != nil || playlistContext != nil
         beginFreshLoad(
             request: request,
             progressPosition: finalizeCurrentSession ? completionProgressPositionForCurrentItem() : currentTime,
@@ -8321,11 +8405,11 @@ class PlayerViewModel {
     /// keep playing in its preview instead of stopping on a frozen frame.
     /// Returns false when the caller should finish the item at EOF instead.
     private func presentNextUpOverCredits() -> Bool {
-        // A shuffle plays every part of a multi-part item first: skipping
+        // A queue plays every part of a multi-part item first: skipping
         // credits finishes the part at EOF, which starts the next one.
         guard !isWatchPartyPlayback,
               canShowNextUpScreen,
-              nextShufflePart == nil,
+              nextQueuePart == nil,
               !hasReachedEndOfFile,
               !isNextUpTransitioning,
               let epoch = activeAetherLoadEpoch,
@@ -9761,6 +9845,8 @@ class PlayerViewModel {
         nextUpCountdownTask?.cancel()
         shuffleTask?.cancel()
         shuffleRefreshTask?.cancel()
+        playlistAdvanceTask?.cancel()
+        playlistAdvanceTask = nil
         skipDebounceTask?.cancel()
         seekFilterTimeoutTask?.cancel()
         holdSeekTask?.cancel()

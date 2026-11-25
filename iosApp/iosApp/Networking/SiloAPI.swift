@@ -555,6 +555,45 @@ actor SiloAPI {
         return list
     }
 
+    // --- Profile-owned playlists ---
+
+    func playlistCapability() async throws -> Bool {
+        let auth = try await detailReadAuth()
+        let result = try await apiV2Client.playlistRead(PlaylistCapability.self, suffix: "/capabilities", auth: auth)
+        try await requireCurrentOwner(auth)
+        return result.available
+    }
+
+    func playlists() async throws -> [PlaylistSummary] {
+        let auth = try await detailReadAuth()
+        let result = try await apiV2Client.playlistRead(PlaylistList.self, auth: auth)
+        try await requireCurrentOwner(auth)
+        return result.items
+    }
+
+    func playlist(id: String) async throws -> PlaylistDetail {
+        let auth = try await detailReadAuth()
+        let result = try await apiV2Client.playlistRead(PlaylistDetail.self, id: id, auth: auth)
+        try await requireCurrentOwner(auth)
+        return result
+    }
+
+    func startPlaylist(id: String, entryId: String) async throws -> (PlaylistEntry, PlaylistPlaybackContext)? {
+        let auth = try await detailReadAuth()
+        let context = PlaylistPlaybackContext(playlistId: id, entryId: entryId, auth: auth)
+        guard let entry = try await resolvePlaylist(context, after: false) else { return nil }
+        return (entry, PlaylistPlaybackContext(playlistId: id, entryId: entry.id, auth: auth))
+    }
+
+    func resolvePlaylist(_ context: PlaylistPlaybackContext, after: Bool) async throws -> PlaylistEntry? {
+        let result = try await apiV2Client.playlistRead(PlaylistPlaybackResult.self,
+            id: context.playlistId, suffix: "/playback",
+            query: ["entry_id": context.entryId, "after": after ? "true" : "false"], auth: context.auth)
+        try await requireCurrentOwner(context.auth)
+        if after, result.entry?.id == context.entryId { throw HTTPError.invalidResponse }
+        return result.entry
+    }
+
     // --- Collections (personal) ---
 
     /// The acting profile's collections and the account's groups. A list read

@@ -993,6 +993,7 @@ final class TVWindowMenuPressUIView: UIView, UIGestureRecognizerDelegate {
 // MARK: - For You dropdown
 
 private enum TVForYouAction: Hashable {
+    case playlists
     case watchlist
     case favorites
     case recommendations
@@ -1010,6 +1011,7 @@ struct TVForYouDropdown: View {
     let onWatchlist: () -> Void
     let onFavorites: () -> Void
     let onRecommendations: () -> Void
+    var onPlaylists: (() -> Void)? = nil
 
     @FocusState private var focusedAction: TVForYouAction?
     @State private var lastAppliedEntryGeneration = 0
@@ -1045,6 +1047,9 @@ struct TVForYouDropdown: View {
             actionButton(.menuWatchlist, systemImage: "bookmark.fill", id: .watchlist, action: onWatchlist)
                 .modifier(TVDropdownBoundaryMoveHandler(onMoveUp: onClose, onMoveDown: nil))
             actionButton(.menuFavorites, systemImage: "heart.fill", id: .favorites, action: onFavorites)
+            if let onPlaylists {
+                actionButton(.playlistsTitle, systemImage: "list.bullet", id: .playlists, action: onPlaylists)
+            }
             actionButton(.forYouRecommendations, systemImage: "sparkles", id: .recommendations, action: onRecommendations)
                 .modifier(TVDropdownBoundaryMoveHandler(onMoveUp: nil, onMoveDown: onExitToContent))
         }

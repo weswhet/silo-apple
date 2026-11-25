@@ -414,6 +414,7 @@ final class AppRouter {
         var watchPartyContext: WatchPartyPlaybackContext? = nil
         /// The shuffle this playback starts; its `current` is `contentId`.
         var shuffle: APIv2Shuffle? = nil
+        var playlist: PlaylistPlaybackContext? = nil
         /// Hints supplied by the originating screen (e.g. the detail page,
         /// which has just loaded the catalog item) so the player's now-
         /// playing widget can publish artwork without re-fetching the
@@ -707,6 +708,19 @@ final class AppRouter {
             backdropURL: shuffle.current.backdropUrl
         )
         presentation.shuffle = shuffle
+        presentedPlayer = presentation
+        #endif
+    }
+
+    func presentPlaylist(entry: PlaylistEntry, context: PlaylistPlaybackContext) {
+        #if os(tvOS)
+        guard entry.available, let contentId = entry.itemId else { return }
+        var presentation = PlayerPresentation(
+            contentId: contentId, fileId: nil, audioTrackIndex: nil, subtitleTrackIndex: nil,
+            startFromBeginning: true, resumePosition: nil, prefersLastUsedVersion: false,
+            returnToContentId: nil, posterURL: nil, backdropURL: nil
+        )
+        presentation.playlist = context
         presentedPlayer = presentation
         #endif
     }

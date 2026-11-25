@@ -16,8 +16,10 @@ func tvVisibleRootsFocusRearm(
 
 #if os(tvOS)
 import SwiftUI
+import OSLog
 
 private enum TVPersonalRootDestination: Hashable {
+    case playlists
     case watchlist
     case favorites
     case requests
@@ -40,6 +42,9 @@ struct TVMainTabView: View {
     /// The previously selected content root stays underneath and is restored
     /// when the user backs out of the personal page.
     @State private var personalRoot: TVPersonalRootDestination?
+    @State private var playlistsAvailable = false
+    @State private var playlistProbeNeedsRetry = true
+    @State private var playlistProbeInFlight = false
     /// Seeded from the startup prefetch so the bar's first frame already
     /// shows the active profile's avatar instead of filling it in late.
     @State private var currentProfile: UserProfile? = {
@@ -253,6 +258,7 @@ struct TVMainTabView: View {
                 backdropURLHint: payload.backdropURL,
                 watchPartyContext: payload.watchPartyContext,
                 shuffle: payload.shuffle,
+                playlist: payload.playlist,
                 onPlaybackStarted: {
                     guard let returnToContentId = payload.returnToContentId,
                           router.presentedPlayer?.id == payload.id else { return }
@@ -279,7 +285,11 @@ struct TVMainTabView: View {
             await loadCurrentProfile()
         }
         .task(id: currentLibraryAuthority) {
+            playlistsAvailable = false
+            playlistProbeNeedsRetry = true
+            if personalRoot == .playlists { personalRoot = nil }
             await loadLibraries(for: currentLibraryAuthority)
+            await refreshPlaylistCapability()
         }
         .onChange(of: closesRequestsRoot, initial: true) { _, close in
             guard close else { return }
@@ -521,6 +531,10 @@ struct TVMainTabView: View {
     @ViewBuilder
     private func personalRootContent(_ destination: TVPersonalRootDestination) -> some View {
         switch destination {
+        case .playlists:
+            TVPlaylistsView(focusRequest: contentFocusRequest, isTopMenuFocused: menuOwnsFocus,
+                onMoveUp: { focusTopMenuIfVisible() })
+                .id(currentLibraryAuthority)
         case .watchlist:
             WatchlistView(
                 showsNavigationTitle: false,
@@ -733,6 +747,27 @@ struct TVMainTabView: View {
         )
     }
 
+    private func refreshPlaylistCapability() async {
+        guard playlistProbeNeedsRetry, !playlistProbeInFlight else { return }
+        let authority = currentLibraryAuthority
+        playlistProbeInFlight = true
+        defer { playlistProbeInFlight = false }
+        do {
+            let available = try await SiloAPI.shared.playlistCapability()
+            guard !Task.isCancelled, authority == currentLibraryAuthority else { return }
+            playlistsAvailable = available
+            playlistProbeNeedsRetry = false
+        } catch {
+            guard !Task.isCancelled, authority == currentLibraryAuthority else { return }
+            playlistsAvailable = false
+            playlistProbeNeedsRetry = !PlaylistCapability.isUnsupported(error)
+            if playlistProbeNeedsRetry {
+                Logger(subsystem: "org.siloserver.silo", category: "Playlists")
+                    .debug("Capability probe failed; retry on menu open: \(String(describing: error), privacy: .private)")
+            }
+        }
+    }
+
     private func forYouPanel(isActive: Bool) -> some View {
         TVForYouDropdown(
             entersPanel: isActive && panelEntersFocus,
@@ -742,8 +777,12 @@ struct TVMainTabView: View {
             onExitToContent: { exitPanelToContent() },
             onWatchlist: { closePanel(then: { navigateFromBar(.watchlist) }) },
             onFavorites: { closePanel(then: { navigateFromBar(.favorites) }) },
-            onRecommendations: { closePanel(then: { selectRoot(.recommendations) }) }
+            onRecommendations: { closePanel(then: { selectRoot(.recommendations) }) },
+            onPlaylists: playlistsAvailable ? { closePanel(then: { showPersonalRoot(.playlists) }) } : nil
         )
+        .task(id: isActive) {
+            if isActive { await refreshPlaylistCapability() }
+        }
     }
 
     private func profilePanel(isActive: Bool) -> some View {

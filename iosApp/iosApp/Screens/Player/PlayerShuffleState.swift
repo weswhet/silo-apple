@@ -89,3 +89,19 @@ enum PlayerMultipartPolicy {
         return candidates.first(where: { $0.resolution == reference.resolution }) ?? candidates.first
     }
 }
+
+/// An explicit queue finishes every file in the current title before moving
+/// to another entry. Ordinary playback keeps its existing postroll behavior.
+enum PlayerQueueContinuation: Equatable {
+    case part(FileVersion)
+    case playlistEntry
+    case postroll
+
+    static func resolve(isPlaylist: Bool, isShuffle: Bool, current: FileVersion?, versions: [FileVersion]) -> Self {
+        if isPlaylist || isShuffle, let current,
+           let next = PlayerMultipartPolicy.nextPart(after: current, in: versions) {
+            return .part(next)
+        }
+        return isPlaylist ? .playlistEntry : .postroll
+    }
+}

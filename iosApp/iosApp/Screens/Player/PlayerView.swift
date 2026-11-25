@@ -31,6 +31,7 @@ struct PlayerView: View {
     let backdropURLHint: String?
     let watchPartyContext: WatchPartyPlaybackContext?
     let shuffle: APIv2Shuffle?
+    let playlist: PlaylistPlaybackContext?
     let onPlaybackStarted: (() -> Void)?
     let onDismissRequested: (() -> Void)?
 
@@ -85,6 +86,7 @@ struct PlayerView: View {
         backdropURLHint: String? = nil,
         watchPartyContext: WatchPartyPlaybackContext? = nil,
         shuffle: APIv2Shuffle? = nil,
+        playlist: PlaylistPlaybackContext? = nil,
         onPlaybackStarted: (() -> Void)? = nil,
         onDismissRequested: (() -> Void)? = nil
     ) {
@@ -103,6 +105,7 @@ struct PlayerView: View {
         self.backdropURLHint = backdropURLHint
         self.watchPartyContext = watchPartyContext
         self.shuffle = shuffle
+        self.playlist = playlist
         self.onPlaybackStarted = onPlaybackStarted
         self.onDismissRequested = onDismissRequested
     }
@@ -577,7 +580,8 @@ struct PlayerView: View {
                 resumePositionOverride: resumePositionOverride,
                 prefersLastUsedVersion: prefersLastUsedVersion,
                 offlineDownloadId: offlineDownloadId,
-                shuffle: shuffle
+                shuffle: shuffle,
+                playlist: playlist
             )
             #if os(tvOS)
             TVControlReceiver.shared.registerPlayer(activeViewModel, contentId: contentId)
@@ -1328,14 +1332,15 @@ struct PlayerNextUpScreen: View {
 
     private var finishedContent: some View {
         VStack(alignment: isTV ? .leading : .center, spacing: panelSpacing) {
-            Text(viewModel.nextUpScreenVideoEnded ? LocalizedStringResource.upNextEndOfPlayback : .upNextAlmostFinished)
+            Text(viewModel.playlistAwaitingAdvance ? LocalizedStringResource.playlistsTitle :
+                (viewModel.nextUpScreenVideoEnded ? .upNextEndOfPlayback : .upNextAlmostFinished))
                 .font(.system(size: titleSize, weight: .bold))
                 .foregroundStyle(.white)
             Text(finishedMessage)
                 .font(.system(size: bodySize, weight: .medium))
                 .foregroundStyle(.white.opacity(0.62))
                 .frame(maxWidth: 560, alignment: isTV ? .leading : .center)
-            actionRow(hasNextEpisode: false)
+            actionRow(hasNextEpisode: viewModel.playlistAwaitingAdvance)
         }
     }
 
@@ -1580,6 +1585,7 @@ struct PlayerNextUpScreen: View {
     }
 
     private var statusLabel: LocalizedStringResource {
+        if viewModel.playlistAwaitingAdvance { return .upNextHeading }
         if viewModel.nextUpEpisode == nil && !viewModel.isLoadingNextUpEpisode {
             return viewModel.nextUpScreenVideoEnded ? .upNextHeadingFinished : .upNextHeadingNothing
         }
@@ -1594,6 +1600,9 @@ struct PlayerNextUpScreen: View {
     }
 
     private var finishedMessage: LocalizedStringResource {
+        if viewModel.isPlaylistPlayback, viewModel.nextUpStartError == nil {
+            return viewModel.playlistAwaitingAdvance ? .playlistsPaused : .playlistsFinished
+        }
         if viewModel.shuffleState != nil {
             if viewModel.nextUpStartError != nil {
                 return .upNextStartPickFailed
@@ -1658,7 +1667,7 @@ struct PlayerNextUpScreen: View {
     }
 
     private var preferredActionFocusTarget: PlayerNextUpFocusTarget {
-        if viewModel.nextUpEpisode != nil {
+        if viewModel.nextUpEpisode != nil || viewModel.playlistAwaitingAdvance {
             return .playNow
         }
         if !viewModel.nextUpScreenVideoEnded {
