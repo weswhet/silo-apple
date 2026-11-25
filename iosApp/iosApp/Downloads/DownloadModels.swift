@@ -270,7 +270,7 @@ struct OfflineManifest: Codable, Hashable, Sendable {
     let downloadId: String
     let contentId: String
     let episodeId: String?
-    let type: String          // "movie" | "episode"
+    let type: String          // "movie" | "episode" | "audiobook"
     let revision: Int?
     let quality: String
     let effectiveQuality: String?
@@ -729,7 +729,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable, Sendable {
     /// e.g. "2024" or "S1 · E2", stored in English (D44). Rows show
     /// `displaySubtitle(locale:)`.
     var subtitle: String?
-    var type: String?                    // "movie" | "episode" | "series"
+    var type: String?                    // "movie" | "episode" | "series" | "audiobook"
     var seriesId: String?
     /// Cached parent-series title for episode downloads (from the manifest),
     /// so the grouped Downloads UI can label a series card offline.
@@ -742,6 +742,11 @@ struct DownloadRecord: Codable, Identifiable, Hashable, Sendable {
     /// them until the manifest's `seasonNumber` and `episodeNumber` arrive.
     var requestSeasonNumber: Int? = nil
     var requestEpisodeNumber: Int? = nil
+    /// The series' episode labels ("air_date") and the episode's air date,
+    /// stored from a single-episode request; the offline manifest carries
+    /// neither. A date-labeled episode's rows show its date for its code.
+    var episodeLabels: String? = nil
+    var airDate: String? = nil
     var posterThumbhash: String?
     /// ThumbHash of the parent series poster, for an episode download.
     var seriesPosterThumbhash: String? = nil
@@ -771,6 +776,10 @@ struct DownloadRecord: Codable, Identifiable, Hashable, Sendable {
     /// ThumbHash for the record's 2:3 poster tile: an episode's series
     /// poster, since its own poster is the episode still.
     var tileThumbhash: String? { seriesPosterThumbhash ?? posterThumbhash }
+
+    /// An audiobook download: played in the audio player and listed apart
+    /// from movies and series.
+    var isAudiobook: Bool { type.map(SiloMediaType.isAudiobook) ?? false }
 
     /// Completed or revoked: the media occupies storage and stays playable.
     var isOnDevice: Bool { localStatus == .completed || localStatus == .revoked }
@@ -814,6 +823,10 @@ extension DownloadRecord {
         locale: Locale = AppLanguage.formattingLocale,
         both: (String, String) -> LocalizedStringResource = { .catalogEpisodeCaption($0, $1) }
     ) -> String? {
+        if shownNumbers.season != nil, shownNumbers.episode != nil,
+           let date = EpisodeLabel.airDate(labels: episodeLabels, airDate: airDate, locale: locale) {
+            return date
+        }
         let season = shownNumbers.season.map { LocaleFormat.codeNumber($0) }
         let episode = shownNumbers.episode.map { LocaleFormat.codeNumber($0) }
         let resource: LocalizedStringResource
@@ -834,6 +847,19 @@ extension DownloadRecord {
         // A movie's year is stored in ASCII digits (D44).
         guard let subtitle, subtitle.allSatisfy({ $0.isASCII && $0.isNumber }), let year = Int(subtitle) else { return subtitle }
         return LocaleFormat.integer(year, locale: locale)
+    }
+
+    /// A game of a date-labeled series (sports) as "Nov 20, 2026 · Lakers vs
+    /// Kings", the code-and-title shape of episode cards, so two games of one
+    /// league on one day stay apart; the series name for an untitled game
+    /// (stored as "Episode N"). Nil for every other record.
+    func datedGameName(locale: Locale = AppLanguage.formattingLocale) -> String? {
+        guard type == "episode", let episode = shownNumbers.episode,
+              let date = EpisodeLabel.airDate(labels: episodeLabels, airDate: airDate, locale: locale) else { return nil }
+        let game = title.flatMap { $0.isEmpty || $0 == Self.storedEpisodeName(episode) ? nil : $0 }
+        guard let name = game ?? seriesTitle, !name.isEmpty else { return date }
+        let isolated = AppLanguage.isolated(name, language: AppLanguage.language(of: locale))
+        return EpisodeCardCaption.titled(code: date, title: isolated, locale: locale)
     }
 
     /// The name stored for an untitled episode: English "Episode 2" (D44).
@@ -1077,6 +1103,12 @@ struct LocalProgressEntry: Codable, Equatable, Sendable {
     var duration: Double
     var completed: Bool
     var updatedAt: Date
+    /// Set on a resume point seeded from the server's when a book was
+    /// downloaded: the device time it was written. Such an entry carries no
+    /// server time (`updatedAt` is `distantPast`), so a progress read that
+    /// started after it replaces it, and one already in flight leaves it.
+    /// Cleared by any write of this device's own playback.
+    var seededAt: Date? = nil
 }
 
 /// The entire on-disk store blob for one `(server, profile)` scope.

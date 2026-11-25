@@ -133,11 +133,10 @@ struct PlayerView: View {
                 if viewModel.showNextUpScreen && viewModel.error == nil {
                     PlayerNextUpScreen(
                         viewModel: viewModel,
-                        onBack: {
-                            if !viewModel.keepWatchingCurrentEpisode() {
-                                dismissPlayer()
-                            }
-                        },
+                        // Close always leaves the player. Keep Watching is its own
+                        // pill wherever the screen offers it (`nextUpOffersKeepWatching`).
+                        // The tvOS Menu button still keeps watching (onExitCommand).
+                        onClose: { dismissPlayer() },
                         onStopShuffling: {
                             viewModel.stopShuffling()
                             dismissPlayer()
@@ -486,6 +485,13 @@ struct PlayerView: View {
         .onChange(of: viewModel.showControls) { _, visible in
             if visible {
                 hideTimelinePreview()
+            }
+        }
+        // Up Next replaces the controls, so the preview must not carry over
+        // to the next episode's first frame.
+        .onChange(of: viewModel.showNextUpScreen) { _, shown in
+            if shown {
+                hideTimelinePreview(immediately: true)
             }
         }
         .onChange(of: viewModel.bufferingPill?.kind) { _, _ in
@@ -1067,14 +1073,14 @@ private enum PlayerNextUpFocusTarget: Hashable {
     case playNow
     case pickAnother
     case keepWatching
-    case back
+    case close
     case autoPlay
     case stopShuffling
 }
 
 struct PlayerNextUpScreen: View {
     let viewModel: PlayerViewModel
-    let onBack: () -> Void
+    let onClose: () -> Void
     var onStopShuffling: () -> Void = {}
     @FocusState private var focusedTarget: PlayerNextUpFocusTarget?
     @State private var didRequestInitialActionFocus = false
@@ -1357,8 +1363,10 @@ struct PlayerNextUpScreen: View {
                 HStack(spacing: 10) {
                     Text(episodeLabel)
                         .foregroundStyle(.white.opacity(0.62))
-                    Text(episode.title)
-                        .foregroundStyle(.white)
+                    if let title = episode.shownTitle {
+                        Text(title)
+                            .foregroundStyle(.white)
+                    }
                 }
                 .font(.system(size: subtitleSize, weight: .semibold))
                 .lineLimit(compact ? 1 : 2)
@@ -1442,7 +1450,7 @@ struct PlayerNextUpScreen: View {
             }
 
             HStack(spacing: 20) {
-                if !viewModel.nextUpScreenVideoEnded {
+                if viewModel.nextUpOffersKeepWatching {
                     Button(action: { viewModel.keepWatchingCurrentEpisode() }) {
                         HStack(spacing: 16) {
                             Image(systemName: "rectangle.inset.filled")
@@ -1460,20 +1468,21 @@ struct PlayerNextUpScreen: View {
                     .prefersDefaultFocus(!hasNextEpisode, in: defaultFocusNamespace)
                 }
 
-                Button(action: onBack) {
+                Button(action: onClose) {
                     HStack(spacing: 16) {
-                        Image(systemName: "chevron.backward")
-                            .font(.system(size: 26, weight: .semibold))
-                        Text(.commonBack)
+                        Image(systemName: "xmark")
+                            .font(.system(size: 24, weight: .semibold))
+                        Text(.upNextClose)
                             .font(.system(size: 26, weight: .semibold))
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
                     }
-                    .frame(width: 120)
+                    // Grows for longer translations ("Schließen").
+                    .frame(minWidth: 120)
                 }
                 .buttonStyle(TVPillButtonStyle(kind: .secondary))
-                .focused($focusedTarget, equals: .back)
-                .prefersDefaultFocus(!hasNextEpisode && viewModel.nextUpScreenVideoEnded, in: defaultFocusNamespace)
+                .focused($focusedTarget, equals: .close)
+                .prefersDefaultFocus(!hasNextEpisode && !viewModel.nextUpOffersKeepWatching, in: defaultFocusNamespace)
             }
             .onMoveCommand { direction in
                 if direction == .down {
@@ -1509,7 +1518,7 @@ struct PlayerNextUpScreen: View {
             }
 
             HStack(spacing: 10) {
-                if !viewModel.nextUpScreenVideoEnded {
+                if viewModel.nextUpOffersKeepWatching {
                     Button(action: { viewModel.keepWatchingCurrentEpisode() }) {
                         Text(.upNextKeepWatching)
                             .frame(maxWidth: .infinity, minHeight: compact ? 24 : 44)
@@ -1518,8 +1527,8 @@ struct PlayerNextUpScreen: View {
                     .frame(minHeight: 44)
                     .disabled(viewModel.isStartingNextUp)
                 }
-                Button(action: onBack) {
-                    Label(.commonBack, systemImage: "chevron.backward")
+                Button(action: onClose) {
+                    Label(.upNextClose, systemImage: "xmark")
                         .frame(minHeight: compact ? 24 : 44)
                 }
                 .siloSecondaryButton()
@@ -1670,10 +1679,10 @@ struct PlayerNextUpScreen: View {
         if viewModel.nextUpEpisode != nil || viewModel.playlistAwaitingAdvance {
             return .playNow
         }
-        if !viewModel.nextUpScreenVideoEnded {
+        if viewModel.nextUpOffersKeepWatching {
             return .keepWatching
         }
-        return .back
+        return .close
     }
 
     private func playOnDeckItem(contentId: String) {
@@ -1696,7 +1705,10 @@ struct PlayerNextUpScreen: View {
 
     private func episodeMetadataLine(for episode: PlayerNextUpEpisode) -> String {
         var parts: [String] = []
-        if let airDate = episode.airDate, !airDate.isEmpty {
+        // A date-labeled series (sports) already names the episode by its
+        // air date in the label above.
+        if !EpisodeLabel.labelsByAirDate(episode.episodeLabels),
+           let airDate = episode.airDate, !airDate.isEmpty {
             parts.append(formatAirDate(airDate))
         }
         if let runtime = MediaTextFormatting.runtime(minutes: episode.runtime) {
@@ -1705,9 +1717,9 @@ struct PlayerNextUpScreen: View {
         return parts.joined(separator: " · ")
     }
 
+    /// A calendar date, the same day in every time zone.
     private func formatAirDate(_ airDate: String) -> String {
-        guard let date = try? Date(airDate, strategy: .iso8601) else { return airDate }
-        return date.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted, locale: AppLanguage.formattingLocale))
+        DetailDateFormatting.abbreviatedDate(airDate) ?? airDate
     }
 
     /// One centered column shared by the hero and On Deck, as wide as four

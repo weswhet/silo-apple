@@ -7,13 +7,24 @@ struct WatchlistView: View {
     var focusRequest: Int
     var isTopMenuFocused: Bool
     var onTopMenuFocusRequest: (() -> Void)?
+    /// Set when the list is a page of the iPhone For You tab.
+    var dockPage: PersonalListDockPage?
 
     @State private var items: [BrowseItem] = []
     @State private var isLoading = false
     @State private var error: ErrorState?
+    /// Counts loads, so a reply overtaken by a later load is dropped.
+    @State private var loadGeneration = 0
     @State private var uiCustomization = UICustomizationPreferences.shared
     #if os(iOS)
     @State private var selectedSection: PersonalMediaSection = .movies
+    @State private var navPrefs = AppNavPreferences.shared
+
+    /// The picked section, falling back to Movies if audiobooks were turned
+    /// off while Audiobooks was picked.
+    private var activeSection: PersonalMediaSection {
+        selectedSection.resolved(showAudiobooks: navPrefs.showAudiobooks)
+    }
     #endif
     @Environment(AppRouter.self) private var router
     @Environment(\.horizontalSizeClass) private var hSize
@@ -43,8 +54,10 @@ struct WatchlistView: View {
         usesTVTopMenu: Bool = false,
         focusRequest: Int = 0,
         isTopMenuFocused: Bool = false,
-        onTopMenuFocusRequest: (() -> Void)? = nil
+        onTopMenuFocusRequest: (() -> Void)? = nil,
+        dockPage: PersonalListDockPage? = nil
     ) {
+        self.dockPage = dockPage
         self.showsNavigationTitle = showsNavigationTitle
         self.usesTVTopMenu = usesTVTopMenu
         self.focusRequest = focusRequest
@@ -93,6 +106,14 @@ struct WatchlistView: View {
         .refreshable {
             await loadWatchlist()
         }
+        #if os(iOS)
+        .onChange(of: dockPage?.reloadRequest) {
+            Task { await loadWatchlist() }
+        }
+        .onChange(of: dockCount, initial: true) {
+            dockPage?.onCount(dockCount)
+        }
+        #endif
         #if os(tvOS)
         .onChange(of: items.map(\.contentId)) { _, _ in applyFocusRequest(focusRequest) }
         #endif
@@ -106,7 +127,12 @@ struct WatchlistView: View {
         ScrollView {
             VStack(spacing: 16) {
                 let visibleItems = filteredIOSItems
-                IOSPersonalMediaSectionPicker(selection: $selectedSection)
+                if dockPage == nil {
+                    IOSPersonalMediaSectionPicker(
+                        selection: Binding(get: { activeSection }, set: { selectedSection = $0 }),
+                        sections: PersonalMediaSection.available(showAudiobooks: navPrefs.showAudiobooks)
+                    )
+                }
 
                 if visibleItems.isEmpty {
                     iosSelectedSectionEmptyState
@@ -122,7 +148,9 @@ struct WatchlistView: View {
             .padding(SiloTheme.padding)
         }
         .reportsPageChromeScroll()
+        .scrollsToTopOnLibraryDockRequest()
         #else
+        let coverAspect = items.savedListCoverAspect
         ScrollView {
             LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(items) { item in
@@ -141,6 +169,8 @@ struct WatchlistView: View {
                         },
                         playAction: playAction(for: item),
                         contentId: item.contentId,
+                        detailSeedSource: .browse(item),
+                        aspect: coverAspect,
                         onUserStateChanged: { state in
                             guard !state.inWatchlist else { return }
                             withAnimation {
@@ -161,6 +191,7 @@ struct WatchlistView: View {
     private var tvGridContent: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 40) {
+                let coverAspect = items.savedListCoverAspect
                 if usesTVTopMenu {
                     Text(.personalWatchlistTitle)
                         .font(.system(size: 64, weight: .bold))
@@ -185,6 +216,8 @@ struct WatchlistView: View {
                             playAction: playAction(for: item),
                             focusedItemId: $focusedContentId,
                             contentId: item.contentId,
+                            detailSeedSource: .browse(item),
+                            aspect: coverAspect,
                             cardWidthOverride: tvCardWidthOverride,
                             onUserStateChanged: { state in
                                 guard !state.inWatchlist else { return }
@@ -229,12 +262,26 @@ struct WatchlistView: View {
     }
     #elseif os(iOS)
     private var filteredIOSItems: [BrowseItem] {
-        items.filter(selectedSection.includes)
+        if let dockPage { return items.filter(dockPage.filter.includes) }
+        return items.filter(activeSection.includes)
+    }
+
+    /// The type the picker or the dock narrows to; the dock's All never
+    /// reaches the empty state, which needs a list with nothing at all.
+    private var iosEmptySection: PersonalMediaSection {
+        guard let dockPage else { return activeSection }
+        return dockPage.filter.section ?? .movies
+    }
+
+    /// The count for the For You tab's header; nil until the list loads.
+    private var dockCount: Int? {
+        guard dockPage != nil, !items.isEmpty || (!isLoading && error == nil) else { return nil }
+        return filteredIOSItems.count
     }
 
     private var iosSelectedSectionEmptyState: some View {
         ContentUnavailableView {
-            Label(iosEmptyTitle, systemImage: selectedSection == .movies ? "film" : "tv")
+            Label(iosEmptyTitle, systemImage: iosEmptySection.systemImage)
         } description: {
             Text(.personalWatchlistEmptyBody)
         }
@@ -242,7 +289,11 @@ struct WatchlistView: View {
     }
 
     private var iosEmptyTitle: LocalizedStringResource {
-        selectedSection == .movies ? .personalWatchlistEmptyMoviesTitle : .personalWatchlistEmptyTvShowsTitle
+        switch iosEmptySection {
+        case .movies: .personalWatchlistEmptyMoviesTitle
+        case .tvShows: .personalWatchlistEmptyTvShowsTitle
+        case .audiobooks: .personalWatchlistEmptyAudiobooksTitle
+        }
     }
     #endif
 
@@ -262,6 +313,8 @@ struct WatchlistView: View {
     }
 
     private func loadWatchlist() async {
+        loadGeneration += 1
+        let generation = loadGeneration
         if items.isEmpty,
            let cached: CatalogResponse = ResponseCache.shared.get(CacheKey.watchlist) {
             items = cached.items
@@ -272,9 +325,11 @@ struct WatchlistView: View {
         error = nil
         do {
             let response = try await SiloAPI.shared.watchlist()
+            guard generation == loadGeneration else { return }
             ResponseCache.shared.set(response, for: CacheKey.watchlist)
             items = response.items
         } catch let err {
+            guard generation == loadGeneration else { return }
             if items.isEmpty {
                 self.error = ErrorState(err)
             }

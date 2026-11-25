@@ -2,7 +2,7 @@
 import SwiftUI
 
 /// Phone movie detail: artwork hero, then cast, trailers and extras, the
-/// box set, More Like This and Details. Mirrors TVMovieDetailView's metadata and actions, sized for touch.
+/// box set, its collections, More Like This and Details. Mirrors TVMovieDetailView's metadata and actions, sized for touch.
 struct MovieDetailContent<BelowOverview: View>: View {
     let detail: ItemDetail
     let isFavorite: Bool
@@ -10,6 +10,8 @@ struct MovieDetailContent<BelowOverview: View>: View {
     let isWatched: Bool
     /// The box set the movie belongs to; nil draws no row.
     let boxSet: CatalogBoxSetDetail?
+    /// The collections holding the movie; nil draws no row.
+    let itemCollections: CatalogItemCollections?
     let selectedVersionFileId: Int?
     /// The edition picked on this visit; nil opens on the last-played one.
     let selectedEditionId: String?
@@ -33,6 +35,9 @@ struct MovieDetailContent<BelowOverview: View>: View {
     let onToggleFavorite: () -> Void
     let onToggleWatchlist: () -> Void
     let onToggleWatched: () -> Void
+    /// Nil hides Not interested: the server predates it.
+    var isNotInterested: Bool? = nil
+    var onToggleNotInterested: (() -> Void)? = nil
     let onPersonTap: (String) -> Void
     let onNavigateToItem: (String) -> Void
     /// Play a local extra from the trailers rail. Routed separately from
@@ -50,12 +55,21 @@ struct MovieDetailContent<BelowOverview: View>: View {
     /// Reference-backed scroll state observed only by the small parallax and
     /// pinned-chrome views, keeping the native ScrollView's body stable.
     let scrollState: PhoneDetailScrollState
+    /// `detail` is the tapped card's seed: it has no files, watch state or
+    /// credits yet, so Play and the actions wait in their loading form.
+    var isProvisional = false
+    /// The artwork the seed drew, kept on screen while `detail`'s loads.
+    var seedArtwork: DetailSeedArtwork? = nil
+    /// The viewer's own rating of this movie; nil draws no rating control.
+    var ratingSlot: PhoneRatingSlot? = nil
     /// On-view description-translation affordance, built at the detail call
     /// site (which owns the view model) and rendered under the overview.
     @ViewBuilder let belowOverview: () -> BelowOverview
 
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.locale) private var locale
+    #if os(iOS)
+    @Environment(AppRouter.self) private var router
+    #endif
     /// The position the resume prompt offers; non-nil while it is shown.
     @State private var pendingResumePosition: Double?
     /// The watch state `pendingResumePosition` came from.
@@ -64,42 +78,31 @@ struct MovieDetailContent<BelowOverview: View>: View {
     @State private var resumeLookupTask: Task<Void, Never>?
     /// The download options sheet, opened from the More menu.
     @State private var showDownloadOptions = false
+    /// Personal collection quick-add half-sheet.
+    @State private var isShowingAddToCollection = false
+    #if os(iOS)
+    @State private var hasDeferredRefitForCollectionSheet = false
+    #endif
     /// The viewer opened the Media Info section.
     @State private var showsMediaInfo = false
 
     var body: some View {
-        PhoneDetailPageSurface(
+        PhoneDetailPage(
             backdropURL: detail.backdropUrl,
             backdropThumbhash: detail.backdropThumbhash,
             enablesArtworkGlass: SiloMediaType.isMovieLibrary(detail.type),
-            keepsSideSafeArea: true
-        ) {
-            PhoneDetailPageLayout(scrollState: scrollState) {
-                VStack(alignment: .leading, spacing: heroToContentSpacing) {
-                    hero()
-                    belowFold
-                }
-                .padding(.bottom, 40)
-            } paneArtwork: {
-                hero(pane: .artwork)
-            } paneSidebar: {
-                VStack(spacing: 16) {
-                    hero(pane: .sidebar)
-                    if let effectiveVersion {
-                        playbackSelectors(for: effectiveVersion)
-                    }
-                }
-            } paneContent: {
-                VStack(alignment: .leading, spacing: 32) {
-                    VStack(spacing: 14) {
-                        hero(pane: .overview)
-                        belowOverview()
-                    }
-                    .padding(.horizontal, SiloTheme.safePadding)
-                    belowFold
-                }
-                .padding(.bottom, 40)
+            fallbackBackdropURL: seedArtwork?.backdrop,
+            scrollState: scrollState
+        ) { pane in
+            hero(pane: pane)
+        } sidebarExtras: {
+            if let effectiveVersion {
+                playbackSelectors(for: effectiveVersion)
             }
+        } belowOverview: {
+            belowOverview()
+        } belowFold: {
+            belowFold
         }
         .siloResumePlaybackAlert(
             isPresented: Binding(
@@ -116,16 +119,33 @@ struct MovieDetailContent<BelowOverview: View>: View {
         .onDisappear {
             resumeLookupTask?.cancel()
             resumeLookupTask = nil
+            #if os(iOS)
+            if hasDeferredRefitForCollectionSheet {
+                hasDeferredRefitForCollectionSheet = false
+                router.itemDetailDeferredRefitCount = max(0, router.itemDetailDeferredRefitCount - 1)
+                if !isShowingAddToCollection {
+                    router.refitItemDetail()
+                }
+            }
+            isShowingAddToCollection = false
+            #endif
         }
-    }
-
-    private var heroToContentSpacing: CGFloat {
-        horizontalSizeClass == .regular ? 16 : 32
+        .sheet(isPresented: $isShowingAddToCollection, onDismiss: {
+            #if os(iOS)
+            if hasDeferredRefitForCollectionSheet {
+                hasDeferredRefitForCollectionSheet = false
+                router.itemDetailDeferredRefitCount = max(0, router.itemDetailDeferredRefitCount - 1)
+            }
+            router.refitItemDetail()
+            #endif
+        }) {
+            IOSAddToCollectionSheet(contentId: detail.contentId, itemTitle: detail.title)
+        }
     }
 
     // MARK: - Hero
 
-    private func hero(pane: PhoneDetailHeroPane? = nil) -> some View {
+    private func hero(pane: PhoneDetailHeroPane?) -> some View {
         PhoneDetailHero(
             title: detail.title,
             logoUrl: detail.logoUrl,
@@ -138,11 +158,17 @@ struct MovieDetailContent<BelowOverview: View>: View {
             ratingChip: PhoneHeroMetadata.contentRatingChip(from: detail),
             overview: detail.overview,
             factsLine: PhoneHeroMetadata.movieFactsLine(from: detail, version: effectiveVersion),
-            ratings: detail.displayRatings,
+            // A card carries only some of the ratings row; it waits for the
+            // detail rather than growing under the viewer.
+            ratings: isProvisional ? [] : detail.displayRatings,
             creditText: PhoneHeroMetadata.creditText(from: detail),
             overlayData: OverlayData.from(detail),
             enablesArtworkParallax: SiloMediaType.isMovieLibrary(detail.type),
             pane: pane,
+            fallbackArtworkUrl: seedArtwork?.hero,
+            fallbackPosterUrl: seedArtwork?.poster,
+            // A card seed's rating is unknown until the detail loads.
+            personalRating: isProvisional ? nil : ratingSlot,
             actions: { actionStack },
             belowOverview: { heroExtras }
         )
@@ -163,12 +189,14 @@ struct MovieDetailContent<BelowOverview: View>: View {
     @ViewBuilder
     private var actionStack: some View {
         VStack(spacing: 14) {
-            PhonePrimaryPillButton(
-                icon: "play.fill",
-                title: DetailPlayLabel.item(detail.userData, shown: effectiveVersion, in: availableVersions),
-                action: handlePlayTap,
-                fullWidth: true
+            PhoneVideoPlayButton(
+                // A seed has no watch state, so neither Play nor Resume is known.
+                title: isProvisional
+                    ? AppLanguage.string(.commonLoading, locale: locale)
+                    : DetailPlayLabel.item(detail.userData, shown: effectiveVersion, in: availableVersions),
+                action: handlePlayTap
             )
+            .disabled(isProvisional)
 
             PhoneLabeledActionRow {
                 PhoneLabeledAction(
@@ -221,6 +249,9 @@ struct MovieDetailContent<BelowOverview: View>: View {
                     }
                 }
             }
+            // Watched, Download and More act on state a seed lacks, and the
+            // seed's favorite and watchlist flags are the card's.
+            .disabled(isProvisional)
 
             if let trailerStatusMessage {
                 PhoneTrailerStatusPill(
@@ -301,6 +332,17 @@ struct MovieDetailContent<BelowOverview: View>: View {
         WatchPartyMenuButton(contentId: detail.contentId, title: detail.title, type: detail.type,
             fileId: watchPartyFileId, preview: WatchPartySelectedItem(previewing: detail))
         #endif
+        Button {
+            #if os(iOS)
+            if !hasDeferredRefitForCollectionSheet {
+                hasDeferredRefitForCollectionSheet = true
+                router.itemDetailDeferredRefitCount += 1
+            }
+            #endif
+            isShowingAddToCollection = true
+        } label: {
+            Label(.collectionsAddToMenuAction, systemImage: "folder.badge.plus")
+        }
         if showsDownloadButton {
             Button {
                 showDownloadOptions = true
@@ -314,6 +356,7 @@ struct MovieDetailContent<BelowOverview: View>: View {
             }
             .disabled(isFindingTrailers)
         }
+        NotInterestedMenuButton(isNotInterested: isNotInterested, action: onToggleNotInterested)
     }
 
     // MARK: - Below the fold
@@ -330,10 +373,17 @@ struct MovieDetailContent<BelowOverview: View>: View {
                 PhoneBoxSetRow(boxSet: boxSet, currentContentId: detail.contentId)
             }
 
+            if let collections = ItemCollectionsRowContent(itemCollections) {
+                PhoneItemCollectionsRow(content: collections)
+            }
+
             similarSection
 
-            detailsSection
-                .padding(.horizontal, SiloTheme.safePadding)
+            // A seed's facts are a partial list; show the detail's whole one.
+            if !isProvisional {
+                detailsSection
+                    .padding(.horizontal, SiloTheme.safePadding)
+            }
 
             PhoneMediaInfoSection(version: effectiveVersion, isExpanded: $showsMediaInfo)
         }

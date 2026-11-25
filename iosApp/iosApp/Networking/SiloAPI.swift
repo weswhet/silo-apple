@@ -24,11 +24,13 @@ actor SiloAPI {
     private let imageSizeCapability: ImageSizeCapability?
     /// Test seam for row sizes; production reads `SectionItemLimitSupport.shared`.
     private let sectionItemLimitSupport: SectionItemLimitSupport?
-    /// Servers (`RefreshAccountIdentity.serverId`) that advertised
-    /// `box_sets`, so movie pages do not reread the search capabilities on
-    /// every visit. Only a yes is kept: a server upgraded to box sets while
-    /// the app runs shows its rows on the next movie page.
-    private var boxSetServerIds: Set<String> = []
+    /// Per server (`RefreshAccountIdentity.serverId`), the title-page
+    /// features it advertised (`box_sets`, `item_collections`), so title
+    /// pages do not reread the search capabilities on every visit. Only a
+    /// yes is kept: a server upgraded while the app runs shows its rows on
+    /// the next title page.
+    private var advertisedFeatures: [String: Set<KeyPath<CatalogSearchFeatures, Bool>>] = [:]
+    private static let titlePageFeatures: [KeyPath<CatalogSearchFeatures, Bool>] = [\.boxSets, \.itemCollections]
 
     init(
         http: HTTPClient = .shared,
@@ -307,6 +309,10 @@ actor SiloAPI {
 
     /// The owner a write is sent for. Without one nothing is sent, which the
     /// error says, so the write reads as a definite failure.
+    func captureMutationAuth() async throws -> CapturedOrdinaryRequestAuth {
+        try await mutationAuth()
+    }
+
     private func mutationAuth() async throws -> CapturedOrdinaryRequestAuth {
         guard let auth = await tokenStore.captureOrdinaryRequestAuth() else {
             throw APIv2OwnerChangedBeforeDispatch()
@@ -448,7 +454,7 @@ actor SiloAPI {
     /// `box_sets`.
     func itemBoxSet(contentId: String, libraryId: Int?) async throws -> CatalogBoxSetDetail? {
         let auth = try await detailReadAuth()
-        guard try await serverHasBoxSets(auth) else { return nil }
+        guard try await serverAdvertises(\.boxSets, auth: auth) else { return nil }
         let detail: CatalogBoxSetDetail?
         do {
             detail = try await apiV2Client.catalogItemBoxSet(
@@ -467,16 +473,44 @@ actor SiloAPI {
         return detail
     }
 
-    /// The `box_sets` search capability of `auth`'s server, read with that
+    /// A title-page search capability of `auth`'s server, read with that
     /// same auth so a server switch mid-read cannot file one server's answer
-    /// under another. Kept once the server says yes.
-    private func serverHasBoxSets(_ auth: CapturedOrdinaryRequestAuth) async throws -> Bool {
+    /// under another. Every feature the read says yes to is kept, so a later
+    /// check for the other feature on that server needs no read.
+    private func serverAdvertises(
+        _ feature: KeyPath<CatalogSearchFeatures, Bool>,
+        auth: CapturedOrdinaryRequestAuth
+    ) async throws -> Bool {
         let serverId = auth.account.serverId
-        if boxSetServerIds.contains(serverId) { return true }
-        let supported = try await catalogSearchFeatures(auth: auth).boxSets
+        if advertisedFeatures[serverId]?.contains(feature) == true { return true }
+        let features = try await catalogSearchFeatures(auth: auth)
         try await requireCurrentOwner(auth)
-        if supported { boxSetServerIds.insert(serverId) }
-        return supported
+        advertisedFeatures[serverId, default: []].formUnion(Self.titlePageFeatures.filter { features[keyPath: $0] })
+        return features[keyPath: feature]
+    }
+
+    /// The collections holding the movie or series `contentId` for the
+    /// acting profile, opened from `libraryId` when known. Nil when the
+    /// server has no such title for the viewer, and without a request when
+    /// it does not advertise `item_collections`.
+    func itemCollections(contentId: String, libraryId: Int?) async throws -> CatalogItemCollections? {
+        let auth = try await detailReadAuth()
+        guard try await serverAdvertises(\.itemCollections, auth: auth) else { return nil }
+        let read: CatalogItemCollections?
+        do {
+            read = try await apiV2Client.catalogItemCollections(
+                id: contentId, libraryId: libraryId.map(String.init),
+                artwork: await artworkQuery(.detail), auth: auth
+            )
+        } catch let error as APIv2Error {
+            switch error {
+            case .httpStatus(404): read = nil
+            case .problem(let problem) where problem.status == 404: read = nil
+            default: throw error
+            }
+        }
+        try await requireCurrentOwner(auth)
+        return read
     }
 
     /// Box sets matching `query` for the acting profile, best match first.
@@ -598,20 +632,34 @@ actor SiloAPI {
 
     /// The acting profile's collections and the account's groups. A list read
     /// for one profile is never returned once the session acts as another.
-    func collections() async throws -> CollectionsResponse {
+    func collections(containsItem: String? = nil) async throws -> CollectionsResponse {
         let auth = try await detailReadAuth()
-        let list = try await apiV2Client.personalCollections(auth: auth)
+        let list = try await apiV2Client.personalCollections(containsItem: containsItem, auth: auth)
         let response = CollectionsResponse(collections: list.items, groups: list.groups)
         try await requireCurrentOwner(auth)
         return response
     }
 
-    /// Whether the acting account's store supports collection groups.
+    /// Whether the acting account's store supports collection groups, sharing, and `contains_item`.
     func collectionCapabilities() async throws -> APIv2CollectionCapabilities {
         let auth = try await detailReadAuth()
         let capabilities = try await apiV2Client.collectionCapabilities(auth: auth)
         try await requireCurrentOwner(auth)
         return capabilities
+    }
+
+    /// Reads collection capabilities, returning `nil` only when the server does
+    /// not expose the capabilities route (v1-only or 404). Any other failure throws.
+    func collectionCapabilitiesIfSupported() async throws -> APIv2CollectionCapabilities? {
+        do {
+            return try await collectionCapabilities()
+        } catch let error as APIv2Error {
+            switch error {
+            case .serverUpdateRequired, .httpStatus(404): return nil
+            case .problem(let problem) where problem.status == 404: return nil
+            default: throw error
+            }
+        }
     }
 
     /// Every display card in a personal collection, read as catalog pages.
@@ -626,8 +674,17 @@ actor SiloAPI {
 
     /// `non_retryable`: dispatched once. A lost answer may still have created
     /// the collection, so the caller re-reads the list instead of resending.
-    func createCollection(name: String) async throws -> UserCollection {
-        try await apiV2Client.createCollection(name: name, auth: try await mutationAuth())
+    func createCollection(
+        name: String,
+        auth: CapturedOrdinaryRequestAuth? = nil
+    ) async throws -> UserCollection {
+        let resolvedAuth: CapturedOrdinaryRequestAuth
+        if let auth {
+            resolvedAuth = auth
+        } else {
+            resolvedAuth = try await mutationAuth()
+        }
+        return try await apiV2Client.createCollection(name: name, auth: resolvedAuth)
     }
 
     /// The canonical collection and the version an edit of it must send.
@@ -646,6 +703,88 @@ actor SiloAPI {
     /// Ungrouped). Returns the updated collection.
     func moveCollection(_ version: CollectionEditVersion, toGroupId groupId: String?) async throws -> UserCollection {
         try await apiV2Client.moveCollection(version, toGroupId: groupId)
+    }
+
+    func addItemToCollection(
+        collectionId: String,
+        itemId: String,
+        position: Int = 0,
+        auth: CapturedOrdinaryRequestAuth? = nil
+    ) async throws {
+        let resolvedAuth: CapturedOrdinaryRequestAuth
+        if let auth {
+            resolvedAuth = auth
+        } else {
+            resolvedAuth = try await mutationAuth()
+        }
+        try await apiV2Client.addItemToCollection(
+            collectionId: collectionId,
+            itemId: itemId,
+            position: position,
+            auth: resolvedAuth
+        )
+    }
+
+    func removeItemFromCollection(
+        collectionId: String,
+        itemId: String,
+        auth: CapturedOrdinaryRequestAuth? = nil
+    ) async throws {
+        let resolvedAuth: CapturedOrdinaryRequestAuth
+        if let auth {
+            resolvedAuth = auth
+        } else {
+            resolvedAuth = try await mutationAuth()
+        }
+        try await apiV2Client.removeItemFromCollection(
+            collectionId: collectionId,
+            itemId: itemId,
+            auth: resolvedAuth
+        )
+    }
+
+    func setCollectionShared(_ version: CollectionEditVersion, isShared: Bool) async throws -> UserCollection {
+        try await apiV2Client.setCollectionShared(version, isShared: isShared)
+    }
+
+    func catalogItemCollectionIds(itemId: String) async throws -> Set<String> {
+        let auth = try await detailReadAuth()
+        let ids = try await apiV2Client.catalogItemCollectionIds(itemId: itemId, auth: auth)
+        try await requireCurrentOwner(auth)
+        return ids
+    }
+
+    // --- Profile Sections Layout ---
+
+    func profileLayout(scope: ProfileSectionsScope = .home) async throws -> APIv2ProfileLayoutRead {
+        let auth = try await detailReadAuth()
+        async let rows = apiV2Client.profileSectionSettings(scope: scope, auth: auth)
+        async let saved = apiV2Client.profileSectionOverrides(scope: scope, auth: auth)
+        let (resolvedRows, resolvedSaved) = try await (rows, saved)
+        try await requireCurrentOwner(auth)
+        return APIv2ProfileLayoutRead(auth: auth, scope: scope, rows: resolvedRows, saved: resolvedSaved)
+    }
+
+    func saveProfileLayout(
+        _ overrides: [APIv2SectionOverride],
+        scope: ProfileSectionsScope = .home,
+        auth: CapturedOrdinaryRequestAuth
+    ) async throws {
+        try await apiV2Client.replaceProfileSectionOverrides(overrides, scope: scope, auth: auth)
+    }
+
+    func resetProfileLayout(
+        scope: ProfileSectionsScope = .home,
+        auth: CapturedOrdinaryRequestAuth
+    ) async throws {
+        try await apiV2Client.resetProfileSectionOverrides(scope: scope, auth: auth)
+    }
+
+    func sectionRecipeCatalog() async throws -> APIv2RecipeCatalog {
+        let auth = try await detailReadAuth()
+        let catalog = try await apiV2Client.sectionRecipeCatalog(auth: auth)
+        try await requireCurrentOwner(auth)
+        return catalog
     }
 
     // --- Theme music ---
@@ -688,6 +827,12 @@ actor SiloAPI {
 
     func shuffleCapability() async throws -> APIv2ShuffleCapability {
         try await apiV2Client.shuffleCapability(auth: try await detailReadAuth())
+    }
+
+    // --- Ratings ---
+
+    func shownRatingSources() async throws -> Set<String> {
+        try await apiV2Client.shownRatingSources(auth: try await detailReadAuth())
     }
 
     /// `non_retryable`: dispatched once. A lost answer leaves an unused

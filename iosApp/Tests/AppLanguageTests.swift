@@ -22,7 +22,41 @@ final class AppLanguageMatchingTests: XCTestCase {
         XCTAssertNil(AppLanguage.match("it", shipped: shipped))
         XCTAssertNil(AppLanguage.match("zh-TW", shipped: shipped))
         XCTAssertNil(AppLanguage.match("zh-Hant", shipped: shipped))
+        XCTAssertNil(AppLanguage.match("no", shipped: shipped))
         XCTAssertNil(AppLanguage.match("es", shipped: ["en"]))
+    }
+
+    /// Traditional Chinese tags pick `zh-Hant` and Simplified ones keep
+    /// `zh-Hans` once both ship.
+    func testChineseTagsPickTheirScript() {
+        let both = shipped + ["zh-Hant"]
+        for tag in ["zh-Hant", "zh-TW", "zh-HK", "zh-MO", "zh-Hant-TW", "zh-Hant-HK"] {
+            XCTAssertEqual(AppLanguage.match(tag, shipped: both), "zh-Hant", tag)
+        }
+        for tag in ["zh", "zh-Hans", "zh-CN", "zh-SG", "zh-Hans-HK"] {
+            XCTAssertEqual(AppLanguage.match(tag, shipped: both), "zh-Hans", tag)
+        }
+        XCTAssertEqual(AppLanguage.match(preferences: ["zh-TW", "en"], shipped: both), "zh-Hant")
+    }
+
+    /// Norwegian ships as `nb`. Devices also report `no`, and the system
+    /// sends Nynorsk (`nn`) to Bokmål as well.
+    func testNorwegianTagsPickBokmal() {
+        let withBokmal = shipped + ["nb"]
+        for tag in ["nb", "nb-NO", "no", "no-NO", "nn", "nn-NO"] {
+            XCTAssertEqual(AppLanguage.match(tag, shipped: withBokmal), "nb", tag)
+        }
+        XCTAssertEqual(AppLanguage.match(preferences: ["no-NO", "en"], shipped: withBokmal), "nb")
+        XCTAssertNil(AppLanguage.match("is", shipped: withBokmal))
+    }
+
+    func testRegionalTagsOfNewLanguagesMatchByLanguage() {
+        let more = shipped + ["it", "ru", "sv", "tr"]
+        XCTAssertEqual(AppLanguage.match("it-CH", shipped: more), "it")
+        XCTAssertEqual(AppLanguage.match("sv-FI", shipped: more), "sv")
+        XCTAssertEqual(AppLanguage.match("ru-UA", shipped: more), "ru")
+        XCTAssertEqual(AppLanguage.match("tr-TR", shipped: more), "tr")
+        XCTAssertEqual(AppLanguage.match("pt-PT", shipped: more), "pt-BR")
     }
 
     /// D26: the device's region, calendar and hour cycle stay the user's,
@@ -54,6 +88,54 @@ final class AppLanguageMatchingTests: XCTestCase {
         XCTAssertEqual(AppLanguage.isolated("Severance", language: "en"), "Severance")
     }
 }
+
+#if !os(tvOS)
+final class ResolvedStringCacheTests: XCTestCase {
+    /// Each resource resolves once; another argument or locale is another
+    /// resource, never an earlier one's text.
+    func testResolvesEachResourceOnceAndKeepsArgumentsAndLocalesApart() {
+        let cache = ResolvedStringCache()
+        var resolved: [String] = []
+        func value(_ resource: LocalizedStringResource) -> String {
+            cache.value(for: resource) { resource in
+                let text = String(localized: resource)
+                resolved.append(text)
+                return text
+            }
+        }
+        var english: LocalizedStringResource = "\(45) left"
+        english.locale = Locale(identifier: "en")
+        var other: LocalizedStringResource = "\(46) left"
+        other.locale = Locale(identifier: "en")
+        var french = english
+        french.locale = Locale(identifier: "fr")
+
+        XCTAssertEqual(value(english), "45 left")
+        XCTAssertEqual(value(english), "45 left")
+        XCTAssertEqual(value(other), "46 left")
+        _ = value(french)
+        XCTAssertEqual(resolved.count, 3)
+    }
+
+    /// A key whose argument keeps changing keeps only its newest entries.
+    func testKeepsTheNewestEntriesPerKey() {
+        let cache = ResolvedStringCache(entriesPerKey: 2)
+        var resolutions = 0
+        func value(_ number: Int) -> String {
+            var resource: LocalizedStringResource = "\(number) left"
+            resource.locale = Locale(identifier: "en")
+            return cache.value(for: resource) { resolutions += 1; return String(localized: $0) }
+        }
+        _ = value(1)
+        _ = value(2)
+        _ = value(3)
+        XCTAssertEqual(value(3), "3 left")
+        XCTAssertEqual(resolutions, 3)
+        XCTAssertEqual(value(1), "1 left")
+        XCTAssertEqual(resolutions, 4)
+    }
+}
+#endif
 
 final class AppLanguageReconcilerTests: XCTestCase {
     private typealias R = AppLanguageReconciler

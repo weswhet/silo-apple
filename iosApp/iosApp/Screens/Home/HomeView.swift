@@ -2,6 +2,8 @@ import SwiftUI
 
 extension Notification.Name {
     static let homeSectionsShouldRefresh = Notification.Name("homeSectionsShouldRefresh")
+    static let homeCustomizeRequested = Notification.Name("homeCustomizeRequested")
+    static let libraryCustomizeRequested = Notification.Name("libraryCustomizeRequested")
 }
 
 /// Main home screen. iOS/macOS render resume-first section rows on a flat
@@ -20,6 +22,16 @@ struct HomeView: View {
 
     @State private var viewModel = HomeViewModel()
     #if !os(tvOS)
+    @State private var isCustomizingHome = false
+    @State private var homeEditor = HomeSectionsEditorModel(scope: .home)
+    #endif
+    @State private var watchStateRefresh: Task<Void, Never>?
+    @State private var watchStateRefreshPending = false
+    @State private var hasObservedWatchState = false
+    #if os(macOS)
+    @State private var watchStateWindowVisible = false
+    #endif
+    #if !os(tvOS)
     /// Feeds the glass strip behind the floating header as rows scroll under it.
     @State private var chromeScrollState = PageChromeScrollState()
     #if os(iOS)
@@ -32,15 +44,34 @@ struct HomeView: View {
         SiloTheme.smallPadding + (statusColumn == nil ? 0 : 6)
     }
     @Environment(\.statusColumn) private var statusColumn
-    /// The LazyVStack already contributes its normal section spacing after the
-    /// header runway. Adding a second large header gap pushed the first row
-    /// far down the screen.
-    private let headerToContentGap: CGFloat = 0
     #endif
     #endif
     @Environment(AppRouter.self) private var router
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.locale) private var locale
+
+    private var observesWatchState: Bool {
+        guard scenePhase == .active, router.path.isEmpty, router.presentedPlayer == nil else { return false }
+        #if os(iOS)
+        return router.presentedItemDetail == nil
+        #elseif os(macOS)
+        return watchStateWindowVisible
+        #else
+        return true
+        #endif
+    }
+
+    private struct WatchStateScope: Equatable {
+        let serverID: String?
+        let owner: SessionOwner?
+        let credential: CredentialOwnerSnapshot
+    }
+
+    private var watchStateScope: WatchStateScope? {
+        guard observesWatchState else { return nil }
+        return WatchStateScope(serverID: ServerRegistry.shared.activeServerId, owner: SessionOwner.current(),
+                               credential: TokenStore.shared.ownerSnapshot)
+    }
 
     var body: some View {
         @Bindable var viewModel = viewModel
@@ -111,8 +142,22 @@ struct HomeView: View {
                 .ignoresSafeArea()
 
             Group {
-                if !viewModel.sections.isEmpty {
+                if isCustomizingHome {
+                    IOSHomeCustomizeView(
+                        editor: homeEditor,
+                        loadedSections: viewModel.sections,
+                        topInset: topRunwaySpacing(topSafeAreaInset: 0),
+                        onDone: {
+                            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                                isCustomizingHome = false
+                            }
+                            Task { await viewModel.loadSections() }
+                        }
+                    )
+                    .transition(.opacity)
+                } else if !viewModel.sections.isEmpty {
                     scrollContent
+                        .transition(.opacity)
                 } else if let error = viewModel.error {
                     ErrorView(
                         state: error,
@@ -131,9 +176,10 @@ struct HomeView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(.easeInOut(duration: 0.2), value: isCustomizingHome)
 
             HStack(alignment: .center, spacing: 12) {
-                SidebarToggleButton()
+                SidebarToggleButton(chromeScrollState: chromeScrollState)
                 // The wordmark is pinned with the utilities so it stays put
                 // over the glass strip instead of scrolling away with the feed.
                 // It occupies the same 44pt row as the icon buttons so its
@@ -159,7 +205,14 @@ struct HomeView: View {
                     onSwitchProfile: {
                         router.switchProfile()
                     },
-                    onSignOut: { router.signOutAndReset() }
+                    onSignOut: { router.signOutAndReset() },
+                    customizePageTitle: isCustomizingHome ? nil : AppLanguage.string(.homeCustomizeTitleHome, locale: locale),
+                    onCustomizePage: isCustomizingHome ? nil : {
+                        withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                            isCustomizingHome = true
+                        }
+                    },
+                    chromeScrollState: chromeScrollState
                 )
             }
             .clearsWindowControls()
@@ -199,7 +252,19 @@ struct HomeView: View {
         #endif
         }
         .onReceive(NotificationCenter.default.publisher(for: .homeSectionsShouldRefresh)) { _ in
-            Task { await viewModel.loadSections() }
+            scheduleWatchStateRefresh()
+        }
+        #if !os(tvOS)
+        .onReceive(NotificationCenter.default.publisher(for: .homeCustomizeRequested)) { _ in
+            guard !isCustomizingHome else { return }
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                isCustomizingHome = true
+            }
+        }
+        #endif
+        .onReceive(NotificationCenter.default.publisher(for: .titleMarkedNotInterested)) { note in
+            guard let contentId = note.userInfo?[NotInterestedSync.contentIdKey] as? String else { return }
+            viewModel.removeNotInterested(contentId: contentId)
         }
         // Home stays mounted while the app is away. A load that failed or
         // was cut off meanwhile runs again as the app returns, instead of
@@ -210,6 +275,18 @@ struct HomeView: View {
                 Task { await viewModel.reloadIfInterrupted() }
             }
         }
+        #if os(macOS)
+        .background(MacWindowVisibilityReader { watchStateWindowVisible = $0 })
+        #endif
+        .task(id: watchStateScope) {
+            cancelWatchStateRefresh()
+            guard observesWatchState else { return }
+            // Return to the server even if the socket is unavailable.
+            if hasObservedWatchState { scheduleWatchStateRefresh() }
+            hasObservedWatchState = true
+            await HomeWatchStateRealtime.observe { scheduleWatchStateRefresh() }
+        }
+        .onDisappear { cancelWatchStateRefresh() }
         .alert(
             Text(.homeUpdateFailedTitle),
             isPresented: $viewModel.isShowingActionError
@@ -223,6 +300,29 @@ struct HomeView: View {
             }
         }
         .personalStateNoticeAlert($viewModel.personalStateNotice)
+    }
+
+    private func scheduleWatchStateRefresh() {
+        guard observesWatchState else { return }
+        watchStateRefreshPending = true
+        guard watchStateRefresh == nil else { return }
+        let scope = watchStateScope
+        watchStateRefresh = Task {
+            while watchStateRefreshPending && !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(600)) } catch { return }
+                guard watchStateScope == scope else { break }
+                watchStateRefreshPending = false
+                StartupContentPrefetcher.invalidateHomeSectionsInFlight()
+                await viewModel.loadSections()
+            }
+            if !Task.isCancelled { watchStateRefresh = nil }
+        }
+    }
+
+    private func cancelWatchStateRefresh() {
+        watchStateRefresh?.cancel()
+        watchStateRefresh = nil
+        watchStateRefreshPending = false
     }
 
     // MARK: - Content
@@ -245,16 +345,49 @@ struct HomeView: View {
         let sections = feedSections
         return ScrollView(.vertical, showsIndicators: false) {
             LazyVStack(alignment: .leading, spacing: HomeFeedMetrics.sectionSpacing) {
-                // Clear runway under the pinned header so the first row
-                // starts below the wordmark and utilities.
-                Color.clear
-                    .frame(height: topRunwaySpacing(topSafeAreaInset: topSafeAreaInset))
+                #if os(macOS)
+                // The stack's section spacing after this marker is the Mac's
+                // only top gap; the featured hero takes it back.
+                Color.clear.frame(height: 0)
+                #endif
 
                 ForEach(sections) { section in
                     feedSection(section, leadsPage: section.id == sections.first?.id)
                         .onAppear { warmRows(after: section) }
                 }
+
+                // Quiet bottom-of-feed entry point (like Apple Today View / Safari Start Page)
+                // so customizing Home stays discoverable without cluttering the top bar.
+                HStack {
+                    Spacer(minLength: 0)
+                    Button {
+                        withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                            isCustomizingHome = true
+                        }
+                    } label: {
+                        Label(.homeCustomizeTitleHome, systemImage: "slider.horizontal.3")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.siloSecondaryText)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 10)
+                            .background(
+                                Capsule()
+                                    .fill(Color.white.opacity(0.07))
+                                    .overlay(
+                                        Capsule()
+                                            .strokeBorder(Color.white.opacity(0.10), lineWidth: 0.75)
+                                    )
+                            )
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    Spacer(minLength: 0)
+                }
+                .padding(.top, 8)
             }
+            // Clear runway under the pinned header. The first row starts right
+            // below it, at the same height as on the Libraries and For You tabs.
+            .padding(.top, topRunwaySpacing(topSafeAreaInset: topSafeAreaInset))
             .padding(.bottom, HomeFeedMetrics.bottomRunway)
         }
         .reportsPageChromeScroll(to: chromeScrollState)
@@ -294,7 +427,36 @@ struct HomeView: View {
             section: section,
             onExploreAll: { router.navigate(to: .sectionCatalog(SectionCatalogTarget(section, scope: .home))) },
             onRemoveFromContinueWatching: dismissContinueWatching,
-            onSetWatched: setWatched
+            onSetWatched: setWatched,
+            onMoveToTop: {
+                Task {
+                    let result = await homeEditor.performQuickAction { editor in
+                        editor.moveToTop(id: section.id)
+                    }
+                    if result.succeeded {
+                        await viewModel.loadSections()
+                    } else if let message = result.errorMessage {
+                        viewModel.presentActionError(message: message)
+                    }
+                }
+            },
+            onHideRow: {
+                Task {
+                    let result = await homeEditor.performQuickAction { editor in
+                        editor.setHidden(true, id: section.id)
+                    }
+                    if result.succeeded {
+                        await viewModel.loadSections()
+                    } else if let message = result.errorMessage {
+                        viewModel.presentActionError(message: message)
+                    }
+                }
+            },
+            onCustomizeHome: {
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                    isCustomizingHome = true
+                }
+            }
         )
     }
 
@@ -306,6 +468,9 @@ struct HomeView: View {
         let next = sections.dropFirst(index + 1).prefix(ArtworkLookahead.rowsAhead)
         ArtworkLookahead.warmRows(next, items: \.items) { section, item in
             HomeFeedRow.cardArtwork(for: item, in: section)
+        }
+        ArtworkLookahead.warmRows(next, items: \.collections) { _, card in
+            HomeCollectionsRow.cardArtwork(for: card)
         }
     }
     #endif
@@ -343,9 +508,9 @@ struct HomeView: View {
 
     #if !os(tvOS)
     private func topRunwaySpacing(topSafeAreaInset: CGFloat) -> CGFloat {
-        // Mirror the floating header's vertical footprint (icon-frame height +
-        // bottom padding) so the first row clears it. LazyVStack supplies the
-        // remaining row gap; don't double-count it here.
+        // Mirror the floating header's vertical footprint (top inset +
+        // icon-frame height + bottom padding) so the first row starts right
+        // below it, as it does under the Libraries and For You headers.
         #if os(macOS)
         // The Mac sidebar carries the logo and utilities, so Home has no
         // floating header to clear, and the feed already starts below the
@@ -354,7 +519,7 @@ struct HomeView: View {
         #else
         var runway = topSafeAreaInset + SiloTheme.topBarIconHitSize + SiloTheme.smallPadding
         #if os(iOS)
-        runway += headerTopInset + headerToContentGap
+        runway += headerTopInset
         #else
         runway += SiloTheme.largePadding + SiloTheme.smallPadding
         #endif

@@ -137,7 +137,7 @@ struct TVLibraryGridView: View {
         switch panel {
         case .sort:
             TVBrowseSortPanel(
-                mediaType: viewModel.mediaType,
+                mediaType: CatalogSortKey.sortMediaType(viewModel.mediaType, filter: viewModel.filter),
                 current: viewModel.filter.sort,
                 order: viewModel.filter.effectiveOrder,
                 onSelect: { key in
@@ -333,8 +333,8 @@ struct TVLibraryGridView: View {
         guard !viewModel.items.isEmpty else { return nil }
         let count = viewModel.items.count
         return viewModel.hasMore
-            ? .libraryTitleCountMore(count: count, LocaleFormat.integer(count))
-            : .libraryTitleCount(count: count, LocaleFormat.integer(count))
+            ? .libraryTitleCountMore(count: count, LocaleFormat.groupedCount(count))
+            : .libraryTitleCount(count: count, LocaleFormat.groupedCount(count))
     }
 }
 #endif

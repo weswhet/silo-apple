@@ -36,7 +36,7 @@ struct TVLibraryBrowseView: View {
     // MARK: - Derived
 
     private var contentSections: [ResolvedSection] {
-        sections.filter { !$0.isFeatured && !$0.items.isEmpty }
+        sections.filter { !$0.isFeatured && $0.hasCards }
     }
 
     // MARK: - Body
@@ -78,6 +78,7 @@ struct TVLibraryBrowseView: View {
                         )))
                     }
                 )
+                .environment(\.browseMediaScope, mediaScope)
                 .id(library.id)
             }
         }
@@ -90,6 +91,15 @@ struct TVLibraryBrowseView: View {
         .environment(\.browseLibraryId, library.id)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task { await loadContent() }
+        // Re-read rows after a layout, collection, or watch-state change,
+        // unless the notification names a different library.
+        .onReceive(NotificationCenter.default.publisher(for: .homeSectionsShouldRefresh)) { note in
+            if let targetLibraryId = note.userInfo?[HomeSectionsEditorModel.RefreshNotificationKey.libraryId] as? Int,
+               targetLibraryId != library.id {
+                return
+            }
+            Task { await loadContent() }
+        }
     }
 
     private var emptyHint: some View {

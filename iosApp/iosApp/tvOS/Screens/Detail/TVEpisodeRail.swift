@@ -24,6 +24,8 @@ struct TVEpisodeRail: View {
     /// When non-nil, the matching card is visually highlighted and anchored
     /// at first appearance.
     var currentContentId: String? = nil
+    /// The series' episode labels; "air_date" names episodes by date.
+    var episodeLabels: String? = nil
     var favoriteStates: [String: Bool] = [:]
     var watchlistStates: [String: Bool] = [:]
     /// Card width before the poster-size scale.
@@ -224,6 +226,7 @@ struct TVEpisodeRail: View {
         TVEpisodeCard(
             episode: episode,
             isCurrent: currentContentId == episode.contentId,
+            episodeLabels: episodeLabels,
             baseCardWidth: baseCardWidth,
             posterSize: uiCustomization.cardPresentation.posterSize,
             onSelect: { onSelect(episode.contentId) },
@@ -518,6 +521,8 @@ struct TVEpisodeCard: View {
     @Environment(\.locale) private var locale
     let episode: EpisodeListItem
     var isCurrent: Bool = false
+    /// The series' episode labels; "air_date" names episodes by date.
+    var episodeLabels: String? = nil
     var baseCardWidth: CGFloat = 480
     var posterSize: CardPosterSize = .standard
     let onSelect: () -> Void
@@ -551,6 +556,7 @@ struct TVEpisodeCard: View {
                     for: EpisodeWatchState(episode.userData, playedOverride: playedOverride), isEpisodeStill: episode.stillIsEpisodeStill
                 ),
                 isCurrent: isCurrent,
+                episodeLabels: episodeLabels,
                 cardWidth: cardWidth,
                 stillHeight: stillHeight,
                 stillCornerRadius: stillCornerRadius,
@@ -561,12 +567,16 @@ struct TVEpisodeCard: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityDescription)
 
+        let hasContextMenu = onSetWatched != nil || onSetFavorite != nil || onSetWatchlist != nil
         Group {
-            if onPlay != nil || onSetWatched != nil || onSetFavorite != nil || onSetWatchlist != nil {
+            if hasContextMenu {
                 button.contextMenu { contextActions }
             } else {
                 button
             }
+        }
+        .onPlayPauseCommand {
+            onPlay?(episode.contentId)
         }
         .mediaActionFeedback(actionFeedback)
         .onChange(of: episode.userData?.played) { _, refreshedValue in
@@ -603,69 +613,86 @@ struct TVEpisodeCard: View {
             metadata: EpisodeCardCaption.railMetadata(for: episode),
             isCurrent: isCurrent,
             isPlayed: isPlayed,
+            episodeLabels: episodeLabels,
+            airDate: episode.airDate,
             locale: locale
         )
     }
 
     @ViewBuilder
     private var contextActions: some View {
-        WatchPartyMenuButton(contentId: episode.contentId, title: episode.title ?? "Episode", type: "episode") // i18n-ignore: watch-party payload (D44)
-        if let onPlay {
-            Button {
-                onPlay(episode.contentId)
-            } label: {
-                // String arguments so year-numbered seasons don't render as "S2,021".
-                Label {
-                    Text(.detailPlayEpisode(LocaleFormat.codeNumber(episode.seasonNumber), LocaleFormat.codeNumber(episode.episodeNumber)))
-                } icon: {
-                    Image(systemName: "play.fill")
-                }
-            }
-        }
-
-        MediaStateMenuItems(
-            isWatched: isPlayed,
-            isFavorite: isFavorite,
-            inWatchlist: inWatchlist,
-            watchedSubject: "Episode", // i18n-ignore: fragment for MediaStateMenuItems (shared component, not in this group)
-            isUpdating: actionFeedback.isUpdating,
-            onToggleWatched: onSetWatched.map { update in
-                {
+        // Section 1: Watch state (consistent with the detail More menu).
+        if let onSetWatched {
+            Section {
+                Button {
                     let value = !isPlayed
                     let previous = playedOverride
                     actionFeedback.perform {
                         playedOverride = value
-                        let outcome = await update(episode.contentId, value)
+                        let outcome = await onSetWatched(episode.contentId, value)
                         if outcome != .applied { playedOverride = previous }
                         return outcome
                     }
+                } label: {
+                    Label(
+                        AppLanguage.string(
+                            isPlayed ? .detailMoreMarkEpisodeUnwatched : .detailMoreMarkEpisodeWatched,
+                            locale: locale
+                        ),
+                        systemImage: isPlayed ? "checkmark.circle.fill" : "checkmark.circle"
+                    )
                 }
-            },
-            onToggleFavorite: onSetFavorite.map { update in
-                {
-                    let value = !isFavorite
-                    let previous = favoriteOverride
-                    actionFeedback.perform {
-                        favoriteOverride = value
-                        let outcome = await update(episode.contentId, value)
-                        if outcome != .applied { favoriteOverride = previous }
-                        return outcome
+                .disabled(actionFeedback.isUpdating)
+            }
+        }
+
+        // Section 2: Personal lists.
+        if onSetFavorite != nil || onSetWatchlist != nil {
+            Section {
+                if let onSetFavorite {
+                    Button {
+                        let value = !isFavorite
+                        let previous = favoriteOverride
+                        actionFeedback.perform {
+                            favoriteOverride = value
+                            let outcome = await onSetFavorite(episode.contentId, value)
+                            if outcome != .applied { favoriteOverride = previous }
+                            return outcome
+                        }
+                    } label: {
+                        Label(
+                            AppLanguage.string(
+                                isFavorite ? .detailMoreRemoveFavorite : .detailMoreAddFavorite,
+                                locale: locale
+                            ),
+                            systemImage: isFavorite ? "heart.fill" : "heart"
+                        )
                     }
+                    .disabled(actionFeedback.isUpdating)
                 }
-            },
-            onToggleWatchlist: onSetWatchlist.map { update in
-                {
-                    let value = !inWatchlist
-                    let previous = watchlistOverride
-                    actionFeedback.perform {
-                        watchlistOverride = value
-                        let outcome = await update(episode.contentId, value)
-                        if outcome != .applied { watchlistOverride = previous }
-                        return outcome
+                if let onSetWatchlist {
+                    Button {
+                        let value = !inWatchlist
+                        let previous = watchlistOverride
+                        actionFeedback.perform {
+                            watchlistOverride = value
+                            let outcome = await onSetWatchlist(episode.contentId, value)
+                            if outcome != .applied { watchlistOverride = previous }
+                            return outcome
+                        }
+                    } label: {
+                        Label(
+                            AppLanguage.string(
+                                inWatchlist ? .detailWatchlistRemove : .detailWatchlistAdd,
+                                locale: locale
+                            ),
+                            systemImage: inWatchlist ? "bookmark.fill" : "bookmark"
+                        )
                     }
+                    .disabled(actionFeedback.isUpdating)
                 }
             }
-        )
+        }
     }
 }
 
@@ -677,6 +704,7 @@ private struct EpisodeCardLabel: View {
     /// started.
     var hidesStill = false
     let isCurrent: Bool
+    let episodeLabels: String?
     let cardWidth: CGFloat
     let stillHeight: CGFloat
     let stillCornerRadius: CGFloat
@@ -694,7 +722,7 @@ private struct EpisodeCardLabel: View {
             // episode's synopsis is already in the hero above the rail.
             VStack(alignment: .leading, spacing: TVEpisodeCardCaptionMetrics.lineSpacing) {
                 captionLine(
-                    EpisodeCardCaption.railTitle(for: episode, locale: locale),
+                    EpisodeCardCaption.railTitle(for: episode, episodeLabels: episodeLabels, locale: locale),
                     font: .system(size: usesAnchoredStyle ? 20 : 24, weight: .semibold),
                     height: usesAnchoredStyle
                         ? TVEpisodeCardCaptionMetrics.anchoredTitleHeight

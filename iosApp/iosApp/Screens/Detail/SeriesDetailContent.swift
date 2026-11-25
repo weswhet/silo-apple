@@ -12,6 +12,8 @@ struct SeriesDetailContent<BelowOverview: View>: View {
     let isFavorite: Bool
     let inWatchlist: Bool
     let isWatched: Bool
+    /// The collections holding the series; nil draws no row.
+    let itemCollections: CatalogItemCollections?
     let seasons: [Season]
     let selectedSeason: Season?
     let episodes: [EpisodeListItem]
@@ -51,6 +53,9 @@ struct SeriesDetailContent<BelowOverview: View>: View {
     let onToggleFavorite: () -> Void
     let onToggleWatchlist: () -> Void
     let onToggleWatched: () -> Void
+    /// Nil hides Not interested: the server predates it.
+    var isNotInterested: Bool? = nil
+    var onToggleNotInterested: (() -> Void)? = nil
     let onSetSeasonWatched: (Season, Bool) async -> PersonalStateOutcome
     let onSetEpisodeWatched: (EpisodeListItem, Bool) async -> PersonalStateOutcome
     let onSetEpisodeFavorite: (String, Bool) async -> PersonalStateOutcome
@@ -72,11 +77,19 @@ struct SeriesDetailContent<BelowOverview: View>: View {
     /// Reference-backed scroll state observed only by the small parallax and
     /// pinned-chrome views, keeping the native ScrollView's body stable.
     let scrollState: PhoneDetailScrollState
+    /// `detail` is the tapped card's seed: it has no watch state or credits
+    /// yet, so the series-level actions wait in their loading form. Seasons,
+    /// episodes and Play come from their own requests and work meanwhile.
+    var isProvisional = false
+    /// The artwork the seed drew, kept on screen while `detail`'s loads.
+    var seedArtwork: DetailSeedArtwork? = nil
+    /// The viewer's own rating of the whole series, never an episode; nil
+    /// draws no rating control.
+    var ratingSlot: PhoneRatingSlot? = nil
     /// On-view description-translation affordance, built at the detail call
     /// site (which owns the view model) and rendered under the overview.
     @ViewBuilder let belowOverview: () -> BelowOverview
 
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.locale) private var locale
     @Environment(AppRouter.self) private var router
     @State private var shuffleLauncher = ShuffleLauncher()
@@ -87,6 +100,10 @@ struct SeriesDetailContent<BelowOverview: View>: View {
         let watchState: LeafItemUserData?
     }
     @State private var pendingResume: PendingResume?
+    @State private var isShowingAddToCollection = false
+    #if os(iOS)
+    @State private var hasDeferredRefitForCollectionSheet = false
+    #endif
     /// The Play tap's in-flight watch-state read. A second tap replaces it.
     @State private var resumeLookupTask: Task<Void, Never>?
     @State private var isUpdatingWatched = false
@@ -106,42 +123,26 @@ struct SeriesDetailContent<BelowOverview: View>: View {
     @State private var showsMediaInfo = false
 
     var body: some View {
-        PhoneDetailPageSurface(
+        PhoneDetailPage(
             backdropURL: detail.backdropUrl,
             backdropThumbhash: detail.backdropThumbhash,
             enablesArtworkGlass: true,
-            keepsSideSafeArea: true
-        ) {
-            PhoneDetailPageLayout(scrollState: scrollState) {
-                VStack(alignment: .leading, spacing: heroToContentSpacing) {
-                    hero()
-                    belowFold
-                }
-                .padding(.bottom, 40)
-            } paneArtwork: {
-                hero(pane: .artwork)
-            } paneSidebar: {
-                VStack(spacing: 16) {
-                    hero(pane: .sidebar)
-                    playbackSelectors
-                }
-            } paneContent: {
-                VStack(alignment: .leading, spacing: 32) {
-                    VStack(spacing: 14) {
-                        hero(pane: .overview)
-                        belowOverview()
-                    }
-                    .padding(.horizontal, SiloTheme.safePadding)
-                    belowFold
-                }
-                .padding(.bottom, 40)
-            }
-            #if os(iOS)
-            .environment(\.watchPartyEpisodePreview) { [detail, seasons] episode in
-                WatchPartySelectedItem(previewing: episode, series: detail, seasons: seasons)
-            }
-            #endif
+            fallbackBackdropURL: seedArtwork?.backdrop,
+            scrollState: scrollState
+        ) { pane in
+            hero(pane: pane)
+        } sidebarExtras: {
+            playbackSelectors
+        } belowOverview: {
+            belowOverview()
+        } belowFold: {
+            belowFold
         }
+        #if os(iOS)
+        .environment(\.watchPartyEpisodePreview) { [detail, seasons] episode in
+            WatchPartySelectedItem(previewing: episode, series: detail, seasons: seasons)
+        }
+        #endif
         .siloResumePlaybackAlert(
             isPresented: Binding(
                 get: { pendingResume != nil },
@@ -166,6 +167,27 @@ struct SeriesDetailContent<BelowOverview: View>: View {
             resumeLookupTask?.cancel()
             resumeLookupTask = nil
             pendingEpisodePlayRequest = nil
+            #if os(iOS)
+            if hasDeferredRefitForCollectionSheet {
+                hasDeferredRefitForCollectionSheet = false
+                router.itemDetailDeferredRefitCount = max(0, router.itemDetailDeferredRefitCount - 1)
+                if !isShowingAddToCollection {
+                    router.refitItemDetail()
+                }
+            }
+            isShowingAddToCollection = false
+            #endif
+        }
+        .sheet(isPresented: $isShowingAddToCollection, onDismiss: {
+            #if os(iOS)
+            if hasDeferredRefitForCollectionSheet {
+                hasDeferredRefitForCollectionSheet = false
+                router.itemDetailDeferredRefitCount = max(0, router.itemDetailDeferredRefitCount - 1)
+            }
+            router.refitItemDetail()
+            #endif
+        }) {
+            IOSAddToCollectionSheet(contentId: detail.seriesId ?? detail.contentId, itemTitle: detail.title)
         }
         .onChange(of: hierarchyError) { _, error in
             if error != nil { pendingEpisodePlayRequest = nil }
@@ -197,13 +219,9 @@ struct SeriesDetailContent<BelowOverview: View>: View {
         .shuffleFailureAlert(shuffleLauncher)
     }
 
-    private var heroToContentSpacing: CGFloat {
-        horizontalSizeClass == .regular ? 16 : 32
-    }
-
     // MARK: - Hero
 
-    private func hero(pane: PhoneDetailHeroPane? = nil) -> some View {
+    private func hero(pane: PhoneDetailHeroPane?) -> some View {
         PhoneDetailHero(
             title: detail.title,
             logoUrl: detail.logoUrl,
@@ -216,11 +234,17 @@ struct SeriesDetailContent<BelowOverview: View>: View {
             ratingChip: PhoneHeroMetadata.contentRatingChip(from: detail),
             overview: detail.overview,
             factsLine: PhoneHeroMetadata.seriesFactsLine(from: detail, seasons: seasons),
-            ratings: detail.displayRatings,
+            // A card carries only some of the ratings row; it waits for the
+            // detail rather than growing under the viewer.
+            ratings: isProvisional ? [] : detail.displayRatings,
             creditText: PhoneHeroMetadata.creditText(from: detail),
             overlayData: OverlayData.from(detail),
             enablesArtworkParallax: true,
             pane: pane,
+            fallbackArtworkUrl: seedArtwork?.hero,
+            fallbackPosterUrl: seedArtwork?.poster,
+            // A card seed's rating is unknown until the detail loads.
+            personalRating: isProvisional ? nil : ratingSlot,
             actions: { actionStack },
             // Match MovieDetailContent exactly through the playback controls:
             // Play/actions, show overview and credits, translation affordance,
@@ -248,12 +272,10 @@ struct SeriesDetailContent<BelowOverview: View>: View {
     @ViewBuilder
     private var actionStack: some View {
         VStack(spacing: 14) {
-            PhonePrimaryPillButton(
-                icon: "play.fill",
+            PhoneVideoPlayButton(
                 title: nextUpEpisode.map(playButtonLabel)
                     ?? AppLanguage.string(isLoadingEpisodes ? .detailEpisodesLoading : .commonPlay, locale: locale),
-                action: handlePrimaryPlayTap,
-                fullWidth: true
+                action: handlePrimaryPlayTap
             )
             .disabled(nextUpEpisode == nil && !isLoadingEpisodes)
 
@@ -308,6 +330,10 @@ struct SeriesDetailContent<BelowOverview: View>: View {
                     overflowMenuItems
                 }
             }
+            // More marks the series watched from its watch state and finds
+            // trailers against its trailer list, neither of which a seed has;
+            // the seed's favorite and watchlist flags are the card's.
+            .disabled(isProvisional)
 
             AutoDownloadBanner(
                 seriesId: detail.seriesId ?? detail.contentId,
@@ -418,11 +444,23 @@ struct SeriesDetailContent<BelowOverview: View>: View {
             )
         }
         .disabled(isUpdatingWatched)
+        Button {
+            #if os(iOS)
+            if !hasDeferredRefitForCollectionSheet {
+                hasDeferredRefitForCollectionSheet = true
+                router.itemDetailDeferredRefitCount += 1
+            }
+            #endif
+            isShowingAddToCollection = true
+        } label: {
+            Label(.collectionsAddToMenuAction, systemImage: "folder.badge.plus")
+        }
         Divider()
         Button(action: onFindTrailers) {
             Label(.detailMoreFindTrailers, systemImage: "film")
         }
         .disabled(isFindingTrailers)
+        NotInterestedMenuButton(isNotInterested: isNotInterested, action: onToggleNotInterested)
     }
 
     private var canShuffleSeries: Bool {
@@ -541,7 +579,9 @@ struct SeriesDetailContent<BelowOverview: View>: View {
     /// "Resume S2·E5" when the tap offers to resume, else "Play S2·E5". The
     /// confirmation dialog still lets the user restart instead.
     private func playButtonLabel(for episode: EpisodeListItem) -> String {
-        DetailPlayLabel.episode(episode, shown: shownVersion(for: episode), in: nextUpVersions)
+        DetailPlayLabel.episode(
+            episode, episodeLabels: detail.episodeLabels, shown: shownVersion(for: episode), in: nextUpVersions
+        )
     }
 
     /// The file the page shows for `episode`, once its files have loaded.
@@ -610,11 +650,20 @@ struct SeriesDetailContent<BelowOverview: View>: View {
             if let cast = detail.cast, !cast.isEmpty {
                 castSection(cast: cast)
             }
+            if let collections = ItemCollectionsRowContent(itemCollections) {
+                PhoneItemCollectionsRow(content: collections)
+            }
             trailersSection
-            detailsSection
-                .padding(.horizontal, SiloTheme.safePadding)
+            // A seed's facts are a partial list; show the detail's whole one.
+            if !isProvisional {
+                detailsSection
+                    .padding(.horizontal, SiloTheme.safePadding)
+            }
             similarSection
-            PhoneMediaInfoSection(version: mediaInfoVersion, episode: nextUpEpisode, isExpanded: $showsMediaInfo)
+            PhoneMediaInfoSection(
+                version: mediaInfoVersion, episode: nextUpEpisode, episodeLabels: detail.episodeLabels,
+                isExpanded: $showsMediaInfo
+            )
         }
     }
 
@@ -722,6 +771,7 @@ struct SeriesDetailContent<BelowOverview: View>: View {
                                 handlePlayTap(for: episode)
                             },
                             currentContentId: nextUpEpisode?.contentId,
+                            episodeLabels: detail.episodeLabels,
                             selectsCenteredEpisode: true,
                             onSetWatched: setEpisodeWatched,
                             isUpdatingWatched: isUpdatingWatched,

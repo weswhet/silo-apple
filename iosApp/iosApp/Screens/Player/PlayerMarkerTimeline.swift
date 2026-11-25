@@ -6,15 +6,23 @@ import Foundation
 ///
 /// Built from `marker_segments` when the server sends it. Older responses
 /// carry only the singular `intro` / `credits` / `recap` fields, which hold
-/// the first occurrence of each kind.
+/// the first occurrence of each kind. Previews come only from
+/// `marker_segments`; they are drawn on the timeline and never skipped.
 struct PlayerMarkerTimeline: Equatable, Sendable {
     enum Kind: String, CaseIterable, Sendable {
-        case intro, credits, recap
+        case intro, credits, recap, preview
     }
 
     struct Occurrence: Equatable, Sendable {
         let kind: Kind
         let range: TimeRange
+    }
+
+    /// One occurrence placed on a timeline, as fractions of the duration.
+    struct Band: Equatable, Sendable {
+        let kind: Kind
+        let start: Double
+        let end: Double
     }
 
     static let empty = PlayerMarkerTimeline(occurrences: [])
@@ -57,6 +65,17 @@ struct PlayerMarkerTimeline: Equatable, Sendable {
             .sorted { ($0.range.start, $0.range.end) < ($1.range.start, $1.range.end) }
     }
 
+    /// A band for every occurrence, clamped to the timeline. Overlapping
+    /// occurrences each keep their own band. None without a duration.
+    func bands(duration: Double) -> [Band] {
+        guard duration > 0 else { return [] }
+        return occurrences.compactMap { occurrence in
+            let start = min(max(occurrence.range.start / duration, 0), 1)
+            let end = min(max(occurrence.range.end / duration, 0), 1)
+            return end > start ? Band(kind: occurrence.kind, start: start, end: end) : nil
+        }
+    }
+
     func ranges(_ kind: Kind) -> [TimeRange] {
         occurrences.filter { $0.kind == kind }.map(\.range)
     }
@@ -85,6 +104,19 @@ struct PlayerMarkerTimeline: Equatable, Sendable {
     func isInFinalCredits(at time: Double) -> Bool {
         guard let finalCredits = ranges(.credits).last else { return true }
         return time >= finalCredits.start
+    }
+
+    /// Where the end credits start in a file of `duration` seconds: the last
+    /// credits occurrence that starts in the file's tail window and before
+    /// its end, or nil. Reaching it finishes the item, as the server judges
+    /// a streamed stop (`CreditsLimits.EndCreditsStart`), so credits placed
+    /// earlier in the file never finish it early. The tail window is the last
+    /// 450 s or 40% of an episode, and the last 900 s or 25% of anything else.
+    func endCreditsStart(duration: Double, isEpisode: Bool) -> Double? {
+        guard duration.isFinite, duration > 0 else { return nil }
+        let tail = isEpisode ? min(450, duration * 0.4) : min(900, duration * 0.25)
+        let windowStart = duration - tail
+        return ranges(.credits).map(\.start).filter { $0 >= windowStart && $0 < duration }.max()
     }
 
     /// A `markers_updated` event's view of the file. Its `marker_segments`

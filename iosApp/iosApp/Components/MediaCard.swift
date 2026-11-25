@@ -42,11 +42,22 @@ func episodeRailAccessibilityLabel(
     metadata: String?,
     isCurrent: Bool,
     isPlayed: Bool,
+    episodeLabels: String? = nil,
+    airDate: String? = nil,
     locale: Locale = AppLanguage.formattingLocale
 ) -> String {
-    var components = [EpisodeCardCaption.spokenCode(season: seasonNumber, episode: episodeNumber, locale: locale)]
-    if let title, !title.isEmpty {
-        components.append(title)
+    var components: [String] = []
+    if let name = EpisodeLabel.datedSeriesName(
+        title: title, season: seasonNumber, episode: episodeNumber, style: .spoken,
+        labels: episodeLabels, airDate: airDate, locale: locale
+    ) {
+        // A date-labeled series (sports): the code means nothing.
+        components.append(name)
+    } else {
+        components.append(EpisodeLabel.code(season: seasonNumber, episode: episodeNumber, style: .spoken, locale: locale))
+        if let title, !title.isEmpty {
+            components.append(title)
+        }
     }
     if let metadata, !metadata.isEmpty {
         components.append(metadata)
@@ -99,6 +110,10 @@ struct MediaCard: View {
     /// An episode card's series and episode. When set, a tap opens the
     /// series on that episode instead of loading the episode first.
     var seriesContext: SeriesDetailContext? = nil
+    var collectionTargetTitle: String? = nil
+    /// The item behind the card. A tap offers it to the page it opens,
+    /// which draws from it until its own detail loads.
+    var detailSeedSource: DetailSeedSource? = nil
     var contextPlayTitle: String? = nil
     var contextDetailTitle: String? = nil
     var onOpenContextDetail: (() -> Void)? = nil
@@ -134,6 +149,7 @@ struct MediaCard: View {
     @State private var personalState = MediaCardPersonalState()
     @EnvironmentObject private var overlayStore: OverlayPrefsStore
     #if !os(tvOS)
+    @State private var isShowingAddToCollection = false
     @Environment(AppRouter.self) private var router
     @Environment(\.browseLibraryId) private var browseLibraryId
     #endif
@@ -156,6 +172,10 @@ struct MediaCard: View {
             return CGSize(width: width, height: width)
         }
     }
+
+    /// This card's own artwork, so the detail zooms from the card that was
+    /// tapped even when the same title is in two rows.
+    @State private var zoomSourceID = UUID()
 
     var body: some View {
         cardBody.mediaActionFeedback(personalState.feedback)
@@ -201,6 +221,14 @@ struct MediaCard: View {
         .onChange(of: userState) { _, _ in
             personalState.reset()
         }
+        .sheet(isPresented: $isShowingAddToCollection) {
+            if let targetId = addToCollectionTargetId {
+                IOSAddToCollectionSheet(
+                    contentId: targetId,
+                    itemTitle: seriesContext != nil ? collectionTargetTitle : title
+                )
+            }
+        }
         .frame(width: cardWidth)
         #endif
     }
@@ -210,14 +238,23 @@ struct MediaCard: View {
         Group {
             if let contentId {
                 Button {
+                    DetailSeedStore.offer(
+                        detailSeedSource,
+                        opening: seriesContext?.seriesContentId ?? contentId
+                    )
                     if let seriesContext {
                         router.presentItemDetail(
                             contentId: seriesContext.seriesContentId,
                             libraryId: browseLibraryId,
-                            resumeContext: seriesContext
+                            resumeContext: seriesContext,
+                            zoomSourceID: zoomSourceID
                         )
                     } else {
-                        router.presentItemDetail(contentId: contentId, libraryId: browseLibraryId)
+                        router.presentItemDetail(
+                            contentId: contentId,
+                            libraryId: browseLibraryId,
+                            zoomSourceID: zoomSourceID
+                        )
                     }
                 } label: {
                     cardContent
@@ -267,21 +304,41 @@ struct MediaCard: View {
 
     private var isInWatchlist: Bool { personalState.inWatchlist(userState) }
 
+    private var offersNotInterested: Bool {
+        hasPersonalActions && MediaCardPersonalState.offersNotInterested(type: mediaType, userState)
+    }
+
     private var canSetWatched: Bool {
         onSetWatched != nil || (hasPersonalActions && aspect != .square)
     }
 
     private var hasStateActions: Bool { hasPersonalActions || canSetWatched }
 
+    private var addToCollectionTargetId: String? {
+        guard hasPersonalActions else { return nil }
+        if let mediaType, SiloMediaType.isEpisode(mediaType) {
+            return seriesContext?.seriesContentId
+        }
+        return seriesContext?.seriesContentId ?? contentId
+    }
+
     private var stateMenu: MediaStateMenuItems {
-        MediaStateMenuItems(
+        #if !os(tvOS)
+        let addToCollectionAction: (() -> Void)? = addToCollectionTargetId != nil ? { isShowingAddToCollection = true } : nil
+        #else
+        let addToCollectionAction: (() -> Void)? = nil
+        #endif
+        return MediaStateMenuItems(
             isWatched: isPlayed,
             isFavorite: isFavorite,
             inWatchlist: isInWatchlist,
+            isNotInterested: personalState.isNotInterested(userState),
             isUpdating: personalState.feedback.isUpdating,
             onToggleWatched: canSetWatched ? toggleWatched : nil,
             onToggleFavorite: hasPersonalActions ? togglePersonalFavorite : nil,
-            onToggleWatchlist: hasPersonalActions ? togglePersonalWatchlist : nil
+            onToggleWatchlist: hasPersonalActions ? togglePersonalWatchlist : nil,
+            onToggleNotInterested: offersNotInterested ? toggleNotInterested : nil,
+            onAddToCollection: addToCollectionAction
         )
     }
 
@@ -308,9 +365,14 @@ struct MediaCard: View {
         personalState.toggleWatchlist(contentId: contentId, from: userState, onApplied: onUserStateChanged)
     }
 
+    private func toggleNotInterested() {
+        guard let contentId else { return }
+        personalState.toggleNotInterested(contentId: contentId, from: userState, onApplied: onUserStateChanged)
+    }
+
     private var cardContent: some View {
         VStack(alignment: .leading, spacing: 4) {
-            posterImage
+            posterImage.detailZoomSource(zoomSourceID)
             titleText
             yearText
         }

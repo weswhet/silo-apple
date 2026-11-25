@@ -11,6 +11,23 @@ extension ResolvedSection {
     var offersHomeDismissal: Bool {
         isContinueWatchingSection || sectionType.lowercased() == "next_up"
     }
+
+    /// Whether the row already shows every card its full page would, so it
+    /// gets no Explore all card and no title link.
+    ///
+    /// Only Continue Watching can tell. Its `total_count` is the list's own
+    /// size, and the server keeps reading the list until the row is full, so
+    /// a row shorter than its limit is the whole list. Other rows keep the
+    /// card even when short. Home drops titles another row already shows and
+    /// counts what is left, and Next Up is cut at its limit before dismissed
+    /// series are dropped, so their page can hold more than the row and its
+    /// count.
+    var showsWholeSection: Bool {
+        guard isContinueWatchingSection, let totalCount else { return false }
+        let sentLimit = itemLimit.flatMap { $0 > 0 ? $0 : nil } ?? SectionRowLimit.cards
+        let limit = min(SectionRowLimit.cards, sentLimit)
+        return items.count < limit && totalCount <= items.count
+    }
 }
 
 /// A single section row on the home screen.
@@ -45,6 +62,9 @@ struct SectionRow: View {
     var onItemFocus: ((SectionItem) -> Void)? = nil
     /// tvOS-only: forwarded to `MediaRow.onExploreAllFocus`.
     var onExploreAllFocus: (() -> Void)? = nil
+    /// tvOS-only: a row of collections reports the card that took focus,
+    /// as `onItemFocus` does for a row of titles.
+    var onCollectionFocus: ((SectionCollectionCard) -> Void)? = nil
     /// Optional poster/square card width forwarded to `MediaRow` —
     /// Skyline's dense landing rows (§5.6) pass a compact width.
     var cardWidth: CGFloat? = nil
@@ -131,11 +151,18 @@ struct SectionRow: View {
 
     var body: some View {
         #if os(tvOS)
-        mediaRow
+        if section.holdsCollections {
+            collectionsRow
+        } else {
+            mediaRow
+        }
         #else
         // Continue Watching uses Home's row on every page, so a library's
-        // resume cards keep Home's stills, size and play button.
-        if isContinueWatching {
+        // resume cards keep Home's stills, size and play button. A row of
+        // collections does too, so its cards match on every page.
+        if section.holdsCollections {
+            HomeCollectionsRow(section: section)
+        } else if isContinueWatching {
             HomeFeedRow(
                 section: section,
                 onExploreAll: onExploreAll,
@@ -151,13 +178,32 @@ struct SectionRow: View {
         #endif
     }
 
+    #if os(tvOS)
+    /// No Explore all card: each collection is its own page.
+    private var collectionsRow: some View {
+        TVCollectionsRow(
+            section: section,
+            prefersDefaultFocusOnFirstItem: prefersDefaultFocusOnFirstItem,
+            defaultFocusPriority: defaultFocusPriority,
+            focusRequest: focusRequest,
+            detailReturnFocusRequest: detailReturnFocusRequest,
+            onMoveUp: onMoveUp,
+            onCollectionFocus: onCollectionFocus,
+            cardWidth: cardWidth,
+            cardVerticalPadding: cardVerticalPadding,
+            onMoveDown: onMoveDown,
+            focusRestorationOwner: focusRestorationOwner
+        )
+    }
+    #endif
+
     private var mediaRow: some View {
         MediaRow(
             title: section.displayTitle(in: locale),
             items: section.items,
             onItemTap: selectItem,
             onItemPlay: allowsDirectPlayback ? playItem : nil,
-            onExploreAll: onExploreAll,
+            onExploreAll: section.showsWholeSection ? nil : onExploreAll,
             showProgress: showProgress,
             icon: isContinueWatching ? "play.circle.fill" : nil,
             layout: layout,

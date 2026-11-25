@@ -7,6 +7,10 @@ struct RecommendationsView: View {
     /// tvOS: focus hand-down token from `TVMainTabView`, forwarded to the
     /// Skyline feed so the screen never opens with a dead remote.
     var focusRequest: Int = 0
+    /// tvOS: bumped when a title page opened from a card pops, so the launch
+    /// row reclaims focus, as on Home. Not interested on that page can remove
+    /// the launching card, leaving the engine nothing to restore.
+    var detailReturnFocusRequest: Int = 0
     /// tvOS: the custom top menu owns focus, so deferred content focus
     /// claims must not yank focus away from it.
     var isTopMenuFocused: Bool = false
@@ -21,14 +25,26 @@ struct RecommendationsView: View {
     #endif
     @Environment(AppRouter.self) private var router
     @Environment(\.locale) private var locale
+    #if os(iOS)
+    @Environment(\.statusColumn) private var statusColumn
+
+    /// iPhone, outside the iPhone Duo's cover screen, shows recommendations,
+    /// the watchlist and favorites as pages switched from a dock, as the
+    /// Libraries tab does. iPad and Mac keep the shortcut row.
+    private var usesDockLayout: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone && statusColumn == nil
+    }
+    #endif
 
     init(
         focusRequest: Int = 0,
+        detailReturnFocusRequest: Int = 0,
         isTopMenuFocused: Bool = false,
         onTopMenuFocusRequest: (() -> Void)? = nil,
         viewModel: RecommendationsViewModel? = nil
     ) {
         self.focusRequest = focusRequest
+        self.detailReturnFocusRequest = detailReturnFocusRequest
         self.isTopMenuFocused = isTopMenuFocused
         self.onTopMenuFocusRequest = onTopMenuFocusRequest
         _viewModel = State(initialValue: viewModel ?? RecommendationsViewModel())
@@ -38,6 +54,10 @@ struct RecommendationsView: View {
         rootLayout
             .task {
                 await viewModel.loadRecommendations()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .titleMarkedNotInterested)) { note in
+                guard let contentId = note.userInfo?[NotInterestedSync.contentIdKey] as? String else { return }
+                viewModel.removeNotInterested(contentId: contentId)
             }
         #if !os(tvOS)
             .refreshable {
@@ -54,9 +74,32 @@ struct RecommendationsView: View {
         tvOSPageContent
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         #else
-        // Content scrolls under the pinned header, which sits in a top
-        // safe-area inset with the shared glass strip behind it (same
-        // structure as `LibrariesTabView`).
+        shortcutOrDockLayout
+            .siloPageBackground()
+        #if os(iOS)
+        .toolbar(.hidden, for: .navigationBar)
+        #endif
+        #endif
+    }
+
+    #if !os(tvOS)
+    @ViewBuilder
+    private var shortcutOrDockLayout: some View {
+        #if os(iOS)
+        if usesDockLayout {
+            ForYouDockedView(viewModel: viewModel)
+        } else {
+            shortcutLayout
+        }
+        #else
+        shortcutLayout
+        #endif
+    }
+
+    /// Content scrolls under the pinned header, which sits in a top
+    /// safe-area inset with the shared glass strip behind it (same
+    /// structure as `LibrariesTabView`).
+    private var shortcutLayout: some View {
         pageContent
             .environment(chromeScrollState)
             .safeAreaInset(edge: .top, spacing: 0) {
@@ -65,17 +108,11 @@ struct RecommendationsView: View {
                         PageChromeGlass(scrollState: chromeScrollState)
                     }
             }
-        .siloPageBackground()
-        #if os(iOS)
-        .toolbar(.hidden, for: .navigationBar)
-        #endif
-        #endif
     }
 
-    #if !os(tvOS)
     private var topChrome: some View {
         HStack(spacing: 12) {
-            SidebarToggleButton()
+            SidebarToggleButton(chromeScrollState: chromeScrollState)
 
             Text(.forYouRecommendations)
                 .font(.siloTitle)
@@ -84,6 +121,7 @@ struct RecommendationsView: View {
                     scrollState: chromeScrollState,
                     outset: EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10)
                 )
+                .pageChromeTitleFadesOut(scrollState: chromeScrollState)
 
             Spacer(minLength: 8)
 
@@ -94,7 +132,8 @@ struct RecommendationsView: View {
                 onSwitchProfile: {
                     router.switchProfile()
                 },
-                onSignOut: { router.signOutAndReset() }
+                onSignOut: { router.signOutAndReset() },
+                chromeScrollState: chromeScrollState
             )
         }
         .clearsWindowControls()
@@ -114,6 +153,7 @@ struct RecommendationsView: View {
             TVSkylineSectionFeed(
                 sections: viewModel.sections,
                 focusRequest: focusRequest,
+                detailReturnFocusRequest: detailReturnFocusRequest,
                 isTopMenuFocused: isTopMenuFocused,
                 onTopMenuFocusRequest: onTopMenuFocusRequest,
                 onItemTap: { destinationContentId, item in

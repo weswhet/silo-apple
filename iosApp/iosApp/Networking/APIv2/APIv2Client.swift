@@ -21,6 +21,7 @@ enum APIv2Error: LocalizedError, Sendable {
     /// A conditional resource read answered without a usable strong `ETag`.
     case missingEntityTag
     case incompleteCollection
+    case incompleteHomeLayout
     case invalidCatalogQuery
     case invalidCatalogContinuation
     case invalidPersonalListContinuation
@@ -57,6 +58,8 @@ enum APIv2Error: LocalizedError, Sendable {
             return AppLanguage.string(.errorsAppleV2InvalidCatalogContinuation)
         case .incompleteCollection:
             return AppLanguage.string(.errorsAppleV2IncompleteCollection)
+        case .incompleteHomeLayout:
+            return "The server returned an incomplete section layout."
         case .missingEntityTag:
             return AppLanguage.string(.errorsAppleV2MissingEntityTag)
         case .incompleteRequestList:
@@ -710,6 +713,12 @@ struct APIv2Client: Sendable {
 
     func setWatchlistMembership(id: String, included: Bool, auth: CapturedOrdinaryRequestAuth) async throws {
         try await setMembership(method: included ? "PUT" : "DELETE", collection: "watchlist", id: id, auth: auth)
+    }
+
+    /// Marks or clears Not interested on a movie or series. The server
+    /// refuses episodes and seasons with 422.
+    func setNotInterested(id: String, included: Bool, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await setMembership(method: included ? "PUT" : "DELETE", collection: "not-interested", id: id, auth: auth)
     }
 
     private func setMembership(method: String, collection: String, id: String,

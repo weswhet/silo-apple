@@ -197,8 +197,6 @@ struct TVPlayerScrubber: View {
                     .fill(Color.white.opacity(isTimelineScrubbing ? 0.48 : isFocused ? 0.35 : 0.24))
                     .frame(height: trackHeight)
 
-                introRegion(barWidth: width)
-
                 // Played / scrub-preview fill.
                 Capsule(style: .continuous)
                     .fill(Color.white)
@@ -217,6 +215,14 @@ struct TVPlayerScrubber: View {
                         .frame(width: width * bufferedAhead, height: trackHeight)
                         .offset(x: width * progressFraction)
                 }
+
+                PlayerMarkerBands(
+                    timeline: viewModel.markerTimeline,
+                    duration: viewModel.duration,
+                    width: width,
+                    height: trackHeight,
+                    opacity: isTimelineScrubbing || isFocused ? 0.45 : 0.34
+                )
 
                 // Chapter ticks float on top of the fill — white at full
                 // opacity so they read through the played region too.
@@ -238,20 +244,6 @@ struct TVPlayerScrubber: View {
         // filter-release handoff) into a visible 100 ms slide. With it
         // removed, normal playback ticks step forward discretely (at the
         // periodic observer's cadence) and seek commits snap cleanly.
-    }
-
-    @ViewBuilder
-    private func introRegion(barWidth: CGFloat) -> some View {
-        if let introRange = viewModel.introRange, viewModel.duration > 0 {
-            let start = min(max(introRange.start / viewModel.duration, 0), 1)
-            let end = min(max(introRange.end / viewModel.duration, 0), 1)
-            if end > start {
-                Capsule(style: .continuous)
-                    .fill(Color.cyan.opacity(isTimelineScrubbing || isFocused ? 0.45 : 0.34))
-                    .frame(width: barWidth * (end - start), height: trackHeight)
-                    .offset(x: barWidth * start)
-            }
-        }
     }
 
     @ViewBuilder

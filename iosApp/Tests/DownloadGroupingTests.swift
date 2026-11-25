@@ -85,6 +85,37 @@ final class DownloadGroupingTests: XCTestCase {
         XCTAssertEqual(record.localStatus, .preparing)
     }
 
+    /// A book in a series carries the series id in its manifest. It must
+    /// stay a book: grouped under the series it would list as a "Specials"
+    /// season and play in the video player.
+    func testAudiobookManifestKeepsTheBookOutOfSeriesAndMovies() throws {
+        var book = movie("b1", bytes: 300, title: "")
+        book.title = nil
+        book.type = nil
+        let json = #"{"download_id":"b1","content_id":"b1","type":"audiobook","title":"Oathbringer","quality":"original","media_file_id":"7","series_id":"stormlight","series_title":"The Stormlight Archive","year":2017}"#
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let manifest = try decoder.decode(OfflineManifest.self, from: Data(json.utf8))
+
+        DownloadManager.applyDisplayFields(manifest, to: &book)
+
+        XCTAssertTrue(book.isAudiobook)
+        XCTAssertNil(book.seriesId)
+        XCTAssertNil(book.seriesTitle)
+        // A book row that carries a series id anyway (stored before this
+        // rule) still stays out of series grouping.
+        var seriesBook = book
+        seriesBook.seriesId = "stormlight"
+        let groups = DownloadGroupBuilder.seriesGroups(
+            from: [seriesBook, episode("e1", series: "s1", season: 1, number: 1, bytes: 10)],
+            isWatched: { _ in false },
+            seriesTitle: { _ in nil },
+            isMonitored: { _ in false }
+        )
+        XCTAssertEqual(groups.map(\.seriesId), ["s1"])
+        XCTAssertEqual(DownloadListItem.audiobook(book).downloadIds, ["b1"])
+    }
+
     func testPreparationStatusLines() throws {
         func line(_ state: String, position: Int? = nil, progress: Double? = nil, remaining: Int? = nil) -> String {
             DownloadPreparation(state: state, queuePosition: position, progress: progress, remainingSeconds: remaining).statusLine
@@ -193,14 +224,14 @@ final class DownloadGroupingTests: XCTestCase {
         XCTAssertEqual(olderDownloads.first?.posterThumbhash, "STILL1")
     }
 
-    func testSeasonsAreNewestFirstWithSpecialsLast() {
+    func testSeasonsAscendWithSpecialsFirst() {
         let records = [
             episode("a", series: "s", season: 1, number: 1, bytes: 1),
             episode("b", series: "s", season: 2, number: 1, bytes: 1),
             episode("c", series: "s", season: 0, number: 1, bytes: 1),
         ]
         let group = groups(records).first
-        XCTAssertEqual(group?.seasons.map(\.seasonNumber), [2, 1, 0])
+        XCTAssertEqual(group?.seasons.map(\.seasonNumber), [0, 1, 2])
     }
 
     func testEpisodesWithinSeasonSortedByNumber() {
@@ -234,9 +265,9 @@ final class DownloadGroupingTests: XCTestCase {
         ]
         let group = groups(records).first
         XCTAssertEqual(group?.totalBytes, 550)
-        XCTAssertEqual(group?.seasons.first?.seasonNumber, 2)
-        XCTAssertEqual(group?.seasons.first?.totalBytes, 250)
-        XCTAssertEqual(group?.seasons.first?.episodeCount, 2)
+        XCTAssertEqual(group?.seasons.last?.seasonNumber, 2)
+        XCTAssertEqual(group?.seasons.last?.totalBytes, 250)
+        XCTAssertEqual(group?.seasons.last?.episodeCount, 2)
     }
 
     // MARK: - Title resolution

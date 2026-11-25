@@ -6,11 +6,16 @@ struct MediaStateMenuItems: View {
     let isWatched: Bool
     let isFavorite: Bool
     let inWatchlist: Bool
+    var isNotInterested = false
     var watchedSubject: String? = nil
     var isUpdating = false
     var onToggleWatched: (() -> Void)? = nil
     var onToggleFavorite: (() -> Void)? = nil
     var onToggleWatchlist: (() -> Void)? = nil
+    /// Movies and series only; see `MediaCardPersonalState.offersNotInterested`.
+    var onToggleNotInterested: (() -> Void)? = nil
+    /// Opens the personal collection picker for this item.
+    var onAddToCollection: (() -> Void)? = nil
 
     var body: some View {
         Group {
@@ -35,6 +40,12 @@ struct MediaStateMenuItems: View {
                     )
                 }
             }
+            if let onAddToCollection {
+                Button(action: onAddToCollection) {
+                    Label(.collectionsAddToMenuAction, systemImage: "folder.badge.plus")
+                }
+            }
+            NotInterestedMenuButton(isNotInterested: isNotInterested, action: onToggleNotInterested)
         }
         .disabled(isUpdating)
     }

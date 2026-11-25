@@ -91,6 +91,70 @@ final class PlayerMarkerTimelineTests: XCTestCase {
         XCTAssertTrue(PlayerMarkerTimeline.empty.isInFinalCredits(at: 10))
     }
 
+    /// The timeline draws every occurrence of every kind, previews included,
+    /// and overlapping occurrences each keep a band.
+    func testBandsCoverEveryOccurrenceOfEveryKind() {
+        let timeline = PlayerMarkerTimeline(markerSegments: [
+            segment("recap", 0, 100),
+            segment("intro", 100, 200),
+            segment("intro", 500, 600),
+            segment("recap", 550, 650),
+            segment("credits", 800, 850),
+            segment("credits", 900, 950),
+            segment("preview", 950, 1_000),
+        ])
+
+        XCTAssertEqual(timeline.bands(duration: 1_000), [
+            .init(kind: .recap, start: 0, end: 0.1),
+            .init(kind: .intro, start: 0.1, end: 0.2),
+            .init(kind: .intro, start: 0.5, end: 0.6),
+            .init(kind: .recap, start: 0.55, end: 0.65),
+            .init(kind: .credits, start: 0.8, end: 0.85),
+            .init(kind: .credits, start: 0.9, end: 0.95),
+            .init(kind: .preview, start: 0.95, end: 1),
+        ])
+    }
+
+    func testBandsClampToTheTimelineAndNeedADuration() {
+        let timeline = PlayerMarkerTimeline(markerSegments: [
+            segment("intro", 50, 150),
+            segment("credits", 900, 1_200),
+            segment("preview", 1_100, 1_200),
+        ])
+
+        XCTAssertEqual(timeline.bands(duration: 1_000), [
+            .init(kind: .intro, start: 0.05, end: 0.15),
+            .init(kind: .credits, start: 0.9, end: 1),
+        ])
+        XCTAssertEqual(timeline.bands(duration: 0), [])
+        XCTAssertEqual(timeline.bands(duration: .nan), [])
+    }
+
+    /// The server finishes an item at its end credits only when they start
+    /// in the file's tail window, and a file spanning several episodes ends
+    /// at the last one's.
+    func testEndCreditsStartIsTheLastCreditsInTheTailWindow() {
+        let timeline = PlayerMarkerTimeline(markerSegments: [
+            segment("credits", 1_200, 1_300),
+            segment("credits", 2_200, 2_400),
+            segment("credits", 2_500, 2_590),
+            segment("intro", 2_550, 2_560),
+        ])
+        XCTAssertEqual(timeline.endCreditsStart(duration: 2_600, isEpisode: true), 2_500)
+
+        // An episode's window is the last 450 s or 40%; a movie's the last
+        // 900 s or 25%.
+        let credits = PlayerMarkerTimeline(markerSegments: [segment("credits", 6_500, 7_100)])
+        XCTAssertNil(credits.endCreditsStart(duration: 7_200, isEpisode: true))
+        XCTAssertEqual(credits.endCreditsStart(duration: 7_200, isEpisode: false), 6_500)
+        let short = PlayerMarkerTimeline(markerSegments: [segment("credits", 700, 990)])
+        XCTAssertEqual(short.endCreditsStart(duration: 1_000, isEpisode: true), 700)
+        XCTAssertNil(short.endCreditsStart(duration: 1_000, isEpisode: false))
+
+        XCTAssertNil(credits.endCreditsStart(duration: 0, isEpisode: false))
+        XCTAssertNil(PlayerMarkerTimeline.empty.endCreditsStart(duration: 2_600, isEpisode: true))
+    }
+
     private func segment(_ kind: String, _ start: Double, _ end: Double) -> PlaybackMarkerSegment {
         PlaybackMarkerSegment(kind: kind, startSeconds: start, endSeconds: end)
     }

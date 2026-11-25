@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Movie detail for tvOS: a full-width hero with Play, the version/audio/
 /// subtitle selectors and More, then cast, trailers and extras, the box set,
-/// recommendations and details rails.
+/// the movie's collections, recommendations and details rails.
 struct TVMovieDetailView: View {
     let detail: ItemDetail
     let isFavorite: Bool
@@ -11,6 +11,8 @@ struct TVMovieDetailView: View {
     let isWatched: Bool
     /// The box set the movie belongs to; nil draws no row.
     var boxSet: CatalogBoxSetDetail? = nil
+    /// The collections holding the movie; nil draws no row.
+    var itemCollections: CatalogItemCollections? = nil
     let selectedVersionFileId: Int?
     /// The edition picked on this visit; nil opens on the last-played one.
     let selectedEditionId: String?
@@ -26,14 +28,6 @@ struct TVMovieDetailView: View {
     /// whether remote cards exist at all). Empty hides the rail.
     let trailerEntries: [TrailerRailEntry]
     let onSelectTrailer: (TrailerRailEntry) -> Void
-    /// Whether the manual "Find Trailers" action can be offered.
-    let supportsTrailerFetch: Bool
-    let onFindTrailers: () -> Void
-    /// Copy from the fetch coordinator; nil while idle.
-    let trailerFetchStatus: String?
-    let isFetchingTrailers: Bool
-    /// Called once a terminal fetch message has been on screen long enough.
-    let onTrailerStatusShown: () -> Void
     let onPlay: (_ startFromBeginning: Bool) -> Void
     let onSelectVersion: (Int?) -> Void
     let onSelectEdition: (String) -> Void
@@ -42,6 +36,9 @@ struct TVMovieDetailView: View {
     let onToggleFavorite: () -> Void
     let onToggleWatchlist: () -> Void
     let onToggleWatched: () -> Void
+    /// Nil hides Not interested: the server predates it.
+    var isNotInterested: Bool? = nil
+    var onToggleNotInterested: (() -> Void)? = nil
     let onPersonTap: (String) -> Void
     let onNavigateToItem: (String) -> Void
     /// On-view description translation status, drawn inside the synopsis.
@@ -50,19 +47,33 @@ struct TVMovieDetailView: View {
     /// item keeps the action reachable without adding a focus stop to the
     /// hero, whose synopsis is deliberately not focusable.
     var onTranslateDescription: (() -> Void)? = nil
+    /// The viewer's rating, 1...10, nil when unrated.
+    var userRating: Int? = nil
+    /// False on the card's provisional copy of the page: the star button is
+    /// shown but takes no input yet.
+    var canRate = false
+    /// Nil removes the rating. Nil hides the star button.
+    var onSetRating: ((Int?) -> Void)? = nil
 
     @Namespace private var detailFocusNamespace
-    @FocusState private var playFocused: Bool
+    @FocusState private var focusedAction: TVDetailAction?
+    @State private var preferredAction: TVDetailAction = .play
     /// True while focus sits anywhere in the hero's primary action row —
     /// drives the scroll back to the page-entry (hero at top) framing.
     @FocusState private var actionRowFocused: Bool
-    /// Whole poster rail focus (box set, recommendations), used only to keep
+    /// Whole poster rail focus (box set, collections, recommendations), used only to keep
     /// the rail's heading and focused poster comfortably framed during native
     /// vertical reveal.
     @FocusState private var boxSetRailFocused: Bool
+    @FocusState private var collectionsRailFocused: Bool
     @FocusState private var similarRailFocused: Bool
+    /// True while the star button edits; the page below the action row is
+    /// disabled meanwhile so remote presses have nowhere else to go.
+    @State private var isRatingEditing = false
+    @State private var collectionsModel: AddToCollectionModel?
     private let heroScrollId = "detail-hero"
     private let boxSetSectionScrollId = "detail-box-set-section"
+    private let collectionsSectionScrollId = "detail-collections-section"
     private let similarSectionScrollId = "detail-similar-section"
     @ObservedObject private var profilePrefsStore = ProfilePrefsStore.shared
     @Environment(\.locale) private var locale
@@ -85,6 +96,7 @@ struct TVMovieDetailView: View {
                             synopsisStatus: synopsisStatus,
                             factsLine: TVHeroMetadata.movieFactsLine(from: detail, version: currentVersion),
                             ratings: detail.displayRatings,
+                            personalRating: TVHeroPersonalRating(score: userRating, isSeries: false),
                             starringText: TVHeroMetadata.starringText(from: detail, locale: locale),
                             playbackSummary: TVPlaybackSelectionSummary.make(
                                 currentVersion: currentVersion,
@@ -116,6 +128,11 @@ struct TVMovieDetailView: View {
                                     .focused($boxSetRailFocused)
                                     .id(boxSetSectionScrollId)
                             }
+                            if let collections = ItemCollectionsRowContent(itemCollections) {
+                                TVItemCollectionsRow(content: collections)
+                                    .focused($collectionsRailFocused)
+                                    .id(collectionsSectionScrollId)
+                            }
                             similarSection
                                 .focused($similarRailFocused)
                                 .id(similarSectionScrollId)
@@ -123,11 +140,12 @@ struct TVMovieDetailView: View {
                         }
                         .padding(.horizontal, TVDetailLayout.horizontalInset)
                         .padding(.bottom, TVDetailLayout.pageBottomPadding)
+                        .disabled(isRatingEditing)
                     }
                 }
                 .ignoresSafeArea()
                 .focusScope(detailFocusNamespace)
-                .defaultFocus($playFocused, true, priority: .userInitiated)
+                .defaultFocus($focusedAction, preferredAction, priority: .userInitiated)
                 .detailFocusScroll(
                     proxy: scrollProxy,
                     actionRowFocused: actionRowFocused,
@@ -135,6 +153,22 @@ struct TVMovieDetailView: View {
                     focusedPosterRailId: focusedPosterRailId
                 )
                 .tvActionPopoverHost()
+                .onChange(of: detail.contentId) { _, _ in
+                    collectionsModel = nil
+                }
+                .alert(
+                    Text(.homeUpdateFailedTitle),
+                    isPresented: Binding(
+                        get: { collectionsModel?.errorMessage != nil && collectionsModel?.hasMutationError == true },
+                        set: { if !$0 { collectionsModel?.clearError() } }
+                    )
+                ) {
+                    Button(.homeUpdateFailedOk, role: .cancel) {}
+                } message: {
+                    if let error = collectionsModel?.errorMessage {
+                        Text(verbatim: error)
+                    }
+                }
             }
         }
     }
@@ -142,26 +176,15 @@ struct TVMovieDetailView: View {
     /// The poster rail section holding focus, which the page centers.
     private var focusedPosterRailId: String? {
         if boxSetRailFocused { return boxSetSectionScrollId }
+        if collectionsRailFocused { return collectionsSectionScrollId }
         if similarRailFocused { return similarSectionScrollId }
         return nil
     }
 
     // MARK: - Hero actions
 
-    @ViewBuilder
     private var actionColumn: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            actionRow
-            if let trailerFetchStatus {
-                // Non-focusable readout, so it adds no stop to the action
-                // column's focus traversal.
-                TVTrailerStatusPill(
-                    message: trailerFetchStatus,
-                    isFetching: isFetchingTrailers,
-                    onAutoDismiss: onTrailerStatusShown
-                )
-            }
-        }
+        actionRow
     }
 
     private var actionRow: some View {
@@ -175,10 +198,13 @@ struct TVMovieDetailView: View {
             focusResetKey: detail.contentId,
             initialFocusScope: .page,
             focusNamespace: detailFocusNamespace,
-            playFocused: $playFocused,
+            focusedAction: $focusedAction,
+            preferredAction: $preferredAction,
             rowFocused: $actionRowFocused,
             stabilizesFocusMotion: true,
             primaryButtonWidth: 340,
+            rating: ratingInput,
+            isRatingEditing: $isRatingEditing,
             playbackSelectors: { focusedAction in
                 TVPlaybackActionSelectors(
                     versions: availableVersions,
@@ -205,10 +231,21 @@ struct TVMovieDetailView: View {
         )
     }
 
+    private var ratingInput: TVDetailRating? {
+        guard SiloMediaType.isMovieLibrary(detail.type), let onSetRating else { return nil }
+        return TVDetailRating(
+            score: userRating,
+            isSeries: false,
+            isWatched: isWatched,
+            isAvailable: canRate,
+            onChange: onSetRating
+        )
+    }
+
     // MARK: - More menu
 
     private enum MoreAction: String {
-        case watchParty, favorite, watched, trailers, translate
+        case watchParty, favorite, watched, translate, notInterested
     }
 
     @Environment(AppRouter.self) private var partyRouter
@@ -222,14 +259,6 @@ struct TVMovieDetailView: View {
             items: {
                 var items: [TVActionPopoverItem] = [
                     TVActionPopoverItem(
-                        id: MoreAction.favorite.rawValue,
-                        title: AppLanguage.string(
-                            isFavorite ? .detailMoreRemoveFavorite : .detailMoreAddFavorite,
-                            locale: locale
-                        ),
-                        systemImage: isFavorite ? "heart.fill" : "heart"
-                    ),
-                    TVActionPopoverItem(
                         id: MoreAction.watched.rawValue,
                         title: AppLanguage.string(
                             isWatched ? .detailMoreMarkUnwatched : .detailMoreMarkWatched,
@@ -237,28 +266,144 @@ struct TVMovieDetailView: View {
                         ),
                         systemImage: isWatched ? "checkmark.circle.fill" : "checkmark.circle"
                     ),
+                    TVActionPopoverItem(
+                        id: MoreAction.favorite.rawValue,
+                        title: AppLanguage.string(
+                            isFavorite ? .detailMoreRemoveFavorite : .detailMoreAddFavorite,
+                            locale: locale
+                        ),
+                        systemImage: isFavorite ? "heart.fill" : "heart"
+                    ),
                 ]
-                if supportsTrailerFetch {
+                let collectionChildren: [TVActionPopoverItem] = {
+                    let loadingTitle = AppLanguage.string(.collectionsAddToLoading, locale: locale)
+                    guard let model = collectionsModel else {
+                        return [TVActionPopoverItem(id: "col:loading", title: loadingTitle, isEnabled: false)]
+                    }
+                    if model.isLoading && !model.hasLoaded {
+                        return [TVActionPopoverItem(id: "col:loading", title: loadingTitle, isEnabled: false)]
+                    }
+                    if !model.hasLoaded {
+                        var rows: [TVActionPopoverItem] = []
+                        if let error = model.loadErrorMessage ?? model.errorMessage {
+                            rows.append(TVActionPopoverItem(id: "col:error", title: error, isEnabled: false))
+                        }
+                        rows.append(TVActionPopoverItem(id: "col:retry", title: AppLanguage.string(.commonRetry, locale: locale), systemImage: "arrow.clockwise"))
+                        return rows
+                    }
+                    if model.entries.isEmpty {
+                        return [
+                            TVActionPopoverItem(
+                                id: "col:empty",
+                                title: AppLanguage.string(.collectionsAddToEmptyTv, locale: locale),
+                                isEnabled: false
+                            ),
+                            TVActionPopoverItem(
+                                id: "col:close",
+                                title: AppLanguage.string(.commonBack, locale: locale),
+                                systemImage: "chevron.left",
+                                navigatesBack: true
+                            ),
+                        ]
+                    }
+                    var rows = model.entries.map { entry in
+                        let isUnconfirmed = model.unconfirmedCollectionIds.contains(entry.id)
+                        let systemImage: String = isUnconfirmed
+                            ? "exclamationmark.triangle"
+                            : (entry.containsItem == nil ? "folder.badge.plus" : "folder")
+                        return TVActionPopoverItem(
+                            id: "col:\(entry.id)",
+                            title: entry.collection.name,
+                            detail: entry.itemCount.map { count in
+                                AppLanguage.string(
+                                    .collectionsItemCount(count: count, LocaleFormat.groupedCount(count, locale: locale)),
+                                    locale: locale
+                                )
+                            },
+                            systemImage: systemImage,
+                            isSelected: !isUnconfirmed && entry.containsItem == true,
+                            isEnabled: !model.busyCollectionIds.contains(entry.id) && !isUnconfirmed
+                        )
+                    }
+                    if !model.unconfirmedCollectionIds.isEmpty && !model.isLoading {
+                        rows.insert(
+                            TVActionPopoverItem(id: "col:retry", title: AppLanguage.string(.commonRetry, locale: locale), systemImage: "arrow.clockwise"),
+                            at: 0
+                        )
+                    }
+                    return rows
+                }()
+                let emptyCollectionsHint: String? = {
+                    guard let model = collectionsModel,
+                          model.hasLoaded,
+                          model.errorMessage == nil,
+                          model.entries.isEmpty else { return nil }
+                    return AppLanguage.string(.collectionsAddToEmptyTv, locale: locale)
+                }()
+                items.append(TVActionPopoverItem(
+                    id: "add-to-collection-submenu",
+                    title: AppLanguage.string(.collectionsAddToTitle, locale: locale),
+                    detail: emptyCollectionsHint,
+                    systemImage: "folder.badge.plus",
+                    children: collectionChildren
+                ))
+                if WatchPartyEntry.isAvailable {
                     items.append(TVActionPopoverItem(
-                        id: MoreAction.trailers.rawValue,
-                        title: AppLanguage.string(.detailMoreFindTrailers, locale: locale),
-                        systemImage: "film.stack"
+                        id: MoreAction.watchParty.rawValue,
+                        title: WatchPartyEntry.actionTitle,
+                        systemImage: "person.3",
+                        startsSection: true
                     ))
                 }
+                var startedUtilitySection = false
                 if onTranslateDescription != nil {
                     items.append(TVActionPopoverItem(
                         id: MoreAction.translate.rawValue,
                         title: AppLanguage.string(.detailMoreTranslate, locale: locale),
-                        systemImage: MachineTranslation.symbol
+                        systemImage: MachineTranslation.symbol,
+                        startsSection: !startedUtilitySection
                     ))
+                    startedUtilitySection = true
                 }
-                if WatchPartyEntry.isAvailable {
-                    items.append(TVActionPopoverItem(id: MoreAction.watchParty.rawValue,
-                        title: WatchPartyEntry.actionTitle, systemImage: "person.3"))
+                if let isNotInterested, onToggleNotInterested != nil {
+                    items.append(TVActionPopoverItem(
+                        id: MoreAction.notInterested.rawValue,
+                        title: AppLanguage.string(
+                            isNotInterested ? .cardMenuShowInRecommendations : .cardMenuNotInterested,
+                            locale: locale
+                        ),
+                        systemImage: isNotInterested ? "hand.thumbsup" : "hand.thumbsdown",
+                        startsSection: !startedUtilitySection
+                    ))
                 }
                 return items
             },
+            onOpen: {
+                if collectionsModel == nil || collectionsModel?.contentId != detail.contentId {
+                    let model = AddToCollectionModel(contentId: detail.contentId)
+                    collectionsModel = model
+                    Task { await model.load() }
+                } else if let model = collectionsModel, !model.isLoading, !model.isCreating, model.busyCollectionIds.isEmpty {
+                    Task { await model.load() }
+                }
+            },
             onSelect: { item in
+                if item.id == "col:close" {
+                    return
+                }
+                if item.id == "col:retry" {
+                    if let model = collectionsModel {
+                        Task { await model.load() }
+                    }
+                    return
+                }
+                if item.id.hasPrefix("col:") {
+                    let colId = String(item.id.dropFirst(4))
+                    if let model = collectionsModel {
+                        Task { await model.toggle(collectionId: colId) }
+                    }
+                    return
+                }
                 switch MoreAction(rawValue: item.id) {
                 case .watchParty:
                     WatchPartyEntry.open(contentId: detail.contentId, title: detail.title, type: detail.type,
@@ -268,10 +413,10 @@ struct TVMovieDetailView: View {
                     onToggleFavorite()
                 case .watched:
                     onToggleWatched()
-                case .trailers:
-                    onFindTrailers()
                 case .translate:
                     onTranslateDescription?()
+                case .notInterested:
+                    onToggleNotInterested?()
                 case .none:
                     break
                 }

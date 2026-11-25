@@ -166,11 +166,16 @@ struct LibrariesTabView: View {
     /// Exact sizes by server, profile, library and Movies/Series scope, for
     /// the header caption.
     @State private var libraryCounts: [String: Int] = [:]
+    /// Titles the Browse page's filters leave, by the same keys, while its
+    /// filters or letter narrow the list.
+    @State private var filteredCounts: [String: BrowseViewModel.FilteredTotal] = [:]
     /// Bumped when a page or the library list is refreshed, to read the
     /// header's count again.
     @State private var countRefreshes = 0
     @State private var isDockVisible = false
-    @Environment(LibraryDockHost.self) private var dockHost: LibraryDockHost?
+    @State private var isPageVisible = false
+    @State private var customizerOwnerToken = UUID()
+    @Environment(PageDockHost.self) private var dockHost: PageDockHost?
     @Environment(SiloControlClient.self) private var siloControl
     @Environment(AudioPlaybackStore.self) private var audioStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -241,6 +246,19 @@ struct LibrariesTabView: View {
         .onChange(of: navPrefs.showAudiobooks) {
             applyLibrarySelection()
         }
+        #if os(iOS)
+        .onAppear {
+            isPageVisible = true
+            syncActiveCustomizableLibrary()
+        }
+        .onChange(of: selectedTab) { syncActiveCustomizableLibrary() }
+        .onChange(of: activeLibrary?.id) { syncActiveCustomizableLibrary() }
+        .onChange(of: activeLibrary?.name) { syncActiveCustomizableLibrary() }
+        .onDisappear {
+            isPageVisible = false
+            clearOwnedCustomizableLibrary()
+        }
+        #endif
         .onReceive(NotificationCenter.default.publisher(for: .userLibrariesDidRefresh)) {
             notification in
             guard let response = notification.object as? LibrariesResponse else { return }
@@ -265,11 +283,30 @@ struct LibrariesTabView: View {
         if let library = visibleLibraries.first(where: { $0.id == id }) {
             showInDock(library)
         }
+        syncActiveCustomizableLibrary()
         #endif
         persistLibrarySelection(id)
         showPicker = false
         StartupContentPrefetcher.prefetchLibraryLanding(libraryId: id)
     }
+
+    #if os(iOS)
+    private func syncActiveCustomizableLibrary() {
+        guard isPageVisible else { return }
+        if selectedTab == .recommended, let activeLibrary {
+            router.activeCustomizableLibraryOwner = customizerOwnerToken
+            router.activeCustomizableLibrary = (id: activeLibrary.id, name: activeLibrary.name)
+        } else {
+            clearOwnedCustomizableLibrary()
+        }
+    }
+
+    private func clearOwnedCustomizableLibrary() {
+        guard router.activeCustomizableLibraryOwner == customizerOwnerToken else { return }
+        router.activeCustomizableLibraryOwner = nil
+        router.activeCustomizableLibrary = nil
+    }
+    #endif
 
     @ViewBuilder
     private func loadedContent(activeLibrary: Library) -> some View {
@@ -349,7 +386,12 @@ struct LibrariesTabView: View {
                 onSwitchProfile: {
                     router.switchProfile()
                 },
-                onSignOut: { router.signOutAndReset() }
+                onSignOut: { router.signOutAndReset() },
+                customizePageTitle: selectedTab == .recommended ? AppLanguage.string(.homeCustomizeTitleNamed(activeLibrary.name), locale: locale) : nil,
+                onCustomizePage: selectedTab == .recommended ? {
+                    NotificationCenter.default.post(name: .libraryCustomizeRequested, object: activeLibrary.id)
+                } : nil,
+                chromeScrollState: chromeScrollState
             )
             .padding(.horizontal, SiloTheme.padding)
             .padding(.top, centersHeader ? SiloTheme.padding : SiloTheme.smallPadding)
@@ -394,12 +436,8 @@ struct LibrariesTabView: View {
                         PageChromeGlass(scrollState: chrome)
                     }
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                // Exactly one dock shows: here, or in the tab bar's slot.
-                if !dockIsInSlot {
-                    LibraryDock(model: dock)
-                }
-            }
+            // Exactly one dock shows: here, or in the tab bar's slot.
+            .floatingPageDock(dock, isShown: !dockIsInSlot)
             .onAppear {
                 configureDock(activeLibrary: activeLibrary)
                 isDockVisible = true
@@ -459,6 +497,7 @@ struct LibrariesTabView: View {
                         .environment(\.libraryPageScrollToTopRequest, scrollToTopRequests[tab, default: 0])
                         .environment(\.libraryPageReloadRequest, tab == .library ? browseReloadRequests : nil)
                         .environment(\.libraryPageDidRefresh) { countRefreshes += 1 }
+                        .environment(\.libraryPageFilteredCount, filteredCountReporter(for: tab, library: activeLibrary))
                         .opacity(isSelected ? 1 : 0)
                         .allowsHitTesting(isSelected)
                         .accessibilityHidden(!isSelected)
@@ -485,6 +524,7 @@ struct LibrariesTabView: View {
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(.isHeader)
+                .pageChromeTitleFadesOut(scrollState: pageChromeStates[selectedTab] ?? chromeScrollState)
 
                 Spacer(minLength: 8)
 
@@ -493,7 +533,12 @@ struct LibrariesTabView: View {
                     onOpenSettings: { router.navigate(to: .settings) },
                     onOpenRequests: { router.navigate(to: .requestsHub) },
                     onSwitchProfile: { router.switchProfile() },
-                    onSignOut: { router.signOutAndReset() }
+                    onSignOut: { router.signOutAndReset() },
+                    customizePageTitle: selectedTab == .recommended ? AppLanguage.string(.homeCustomizeTitleNamed(activeLibrary.name), locale: locale) : nil,
+                    onCustomizePage: selectedTab == .recommended ? {
+                        NotificationCenter.default.post(name: .libraryCustomizeRequested, object: activeLibrary.id)
+                    } : nil,
+                    chromeScrollState: pageChromeStates[selectedTab] ?? chromeScrollState
                 )
             }
             .padding(.horizontal, SiloTheme.padding)
@@ -506,9 +551,17 @@ struct LibrariesTabView: View {
         }
     }
 
-    /// The library's size once known, else its kind.
+    /// On the Library page, how many titles its filters leave; otherwise
+    /// the library's size once known, else its kind.
     private func dockCaption(for library: Library) -> LocalizedStringResource {
-        if let count = libraryCounts[countKey(for: library)] {
+        let key = countKey(for: library)
+        let count: Int?
+        switch selectedTab == .library ? filteredCounts[key] : nil {
+        case .exact(let filtered): count = filtered
+        case .uncounted: count = nil
+        case nil: count = libraryCounts[key]
+        }
+        if let count {
             return libraryCountLabel(count, library: library, scope: videoScope(for: library))
         }
         if library.isAudiobookLibrary { return .libraryKindAudiobooks }
@@ -517,6 +570,15 @@ struct LibrariesTabView: View {
         if library.isMovieLibrary { return .libraryKindMovies }
         if library.isMusicLibrary { return .libraryKindMusic }
         return .libraryTypeGeneric
+    }
+
+    private func filteredCountReporter(
+        for tab: LibraryPageTab,
+        library: Library
+    ) -> (@MainActor (BrowseViewModel.FilteredTotal?) -> Void)? {
+        guard tab == .library else { return nil }
+        let key = countKey(for: library)
+        return { filteredCounts[key] = $0 }
     }
 
     /// Names a count by the acting server and profile as well as the library
@@ -528,7 +590,7 @@ struct LibrariesTabView: View {
     /// The tab bar shows the dock in its accessory slot (iOS 26.1 and
     /// later) unless a now-playing bar holds the slot.
     private var dockIsInSlot: Bool {
-        guard LibraryDockHost.slotIsAvailable, isDockVisible,
+        guard PageDockHost.slotIsAvailable, isDockVisible,
               let dockHost, dockHost.dock === dock else { return false }
         return !NowPlayingShelf.hasActiveAccessory(control: siloControl, audio: audioStore)
     }
@@ -754,16 +816,25 @@ private struct LibrariesTopBar: View {
     let onOpenRequests: () -> Void
     let onSwitchProfile: () -> Void
     let onSignOut: () -> Void
+    var customizePageTitle: String? = nil
+    var onCustomizePage: (() -> Void)? = nil
+    let chromeScrollState: PageChromeScrollState
 
     var body: some View {
         HStack(spacing: 12) {
-            SidebarToggleButton()
+            SidebarToggleButton(chromeScrollState: chromeScrollState)
 
             LibrarySelectorButton(
                 library: activeLibrary,
                 canSwitch: canSwitch,
                 onTap: onLibraryTap
             )
+            .pageChromePill(
+                scrollState: chromeScrollState,
+                sideOutset: (leading: 10, trailing: 14)
+            )
+            // Keeps this pill clear of the sidebar button's.
+            .padding(.leading, 8)
 
             Spacer(minLength: 8)
 
@@ -772,7 +843,10 @@ private struct LibrariesTopBar: View {
                 onOpenSettings: onOpenSettings,
                 onOpenRequests: onOpenRequests,
                 onSwitchProfile: onSwitchProfile,
-                onSignOut: onSignOut
+                onSignOut: onSignOut,
+                customizePageTitle: customizePageTitle,
+                onCustomizePage: onCustomizePage,
+                chromeScrollState: chromeScrollState
             )
         }
         .clearsWindowControls()

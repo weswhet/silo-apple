@@ -297,21 +297,23 @@ struct MobilePlayerControls: View {
 
     /// "SEVERANCE · S2:E4"-style context line. Series title + episode tag
     /// for episodes, release year for movies, nothing when metadata hasn't
-    /// resolved yet.
+    /// resolved yet. The series title is server data and uppercases without
+    /// a locale; the episode tag comes from the catalog and uppercases in
+    /// the app's language.
     private var titleEyebrow: String? {
         let metadata = viewModel.metadata
         var parts: [String] = []
         if let series = metadata.seriesTitle, !series.isEmpty {
-            parts.append(series)
+            parts.append(series.uppercased())
         }
         if let tag = metadata.episodeTag, !tag.isEmpty {
-            parts.append(tag)
+            parts.append(tag.uppercased(with: locale))
         }
         if parts.isEmpty, let year = metadata.year {
             parts.append(LocaleFormat.integer(year, locale: locale))
         }
         guard !parts.isEmpty else { return nil }
-        return parts.joined(separator: " · ").uppercased()
+        return parts.joined(separator: " · ")
     }
 
     private var heroTitle: String {
@@ -854,8 +856,6 @@ private struct MobilePlayerTimeline: View {
                         .frame(width: max(width * buffered, barHeight), height: barHeight)
                 }
 
-                introMarker(width: width, height: barHeight)
-
                 // Chapter ticks. Rendered behind the fill so they're visible
                 // in unplayed territory; the fill covers them over played
                 // time, which matches Apple's native transport-bar behavior.
@@ -874,6 +874,14 @@ private struct MobilePlayerTimeline: View {
                     .fill(Color.white)
                     .frame(width: max(width * progress, barHeight), height: barHeight)
                     .shadow(color: .white.opacity(showsPreview ? 0.35 : 0), radius: 8)
+
+                PlayerMarkerBands(
+                    timeline: viewModel.markerTimeline,
+                    duration: viewModel.duration,
+                    width: width,
+                    height: barHeight,
+                    opacity: 0.45
+                )
             }
             .frame(height: 20, alignment: .center)
             .animation(.snappy(duration: 0.22), value: showsPreview)
@@ -985,20 +993,6 @@ private struct MobilePlayerTimeline: View {
         guard let chapter = viewModel.chapters.last(where: { $0.time <= time }) else { return nil }
         return chapter.title
             ?? AppLanguage.string(.optionsChapterNumbered(LocaleFormat.integer(chapter.index + 1, locale: locale)), locale: locale)
-    }
-
-    @ViewBuilder
-    private func introMarker(width: CGFloat, height: CGFloat) -> some View {
-        if let introRange = viewModel.introRange, viewModel.duration > 0 {
-            let start = min(max(introRange.start / viewModel.duration, 0), 1)
-            let end = min(max(introRange.end / viewModel.duration, 0), 1)
-            if end > start {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Color.cyan.opacity(0.4))
-                    .frame(width: width * (end - start), height: height)
-                    .offset(x: width * start)
-            }
-        }
     }
 }
 

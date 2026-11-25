@@ -26,7 +26,8 @@ struct TVPrimaryPillButton: View {
                 icon: icon,
                 title: title,
                 subtitle: subtitle,
-                stabilizesFocusMotion: stabilizesFocusMotion
+                stabilizesFocusMotion: stabilizesFocusMotion,
+                fitsFixedWidth: fixedWidth != nil
             )
         }
         .buttonStyle(
@@ -46,6 +47,10 @@ private struct TVPrimaryPillLabel: View {
     let title: String
     let subtitle: String?
     let stabilizesFocusMotion: Bool
+    /// The pill has a fixed width, so the text must fit the space left
+    /// beside the icon: it scales down, then truncates, instead of drawing
+    /// past the capsule. Without a fixed width the pill grows to fit.
+    let fitsFixedWidth: Bool
 
     @Environment(\.isFocused) private var isFocused
 
@@ -59,6 +64,7 @@ private struct TVPrimaryPillLabel: View {
                     Text(title)
                         .font(.system(size: 29, weight: .semibold))
                         .lineLimit(1)
+                        .minimumScaleFactor(fitsFixedWidth ? 0.7 : 1)
                     if let subtitle, !subtitle.isEmpty {
                         Text(subtitle)
                             .font(.system(size: 16, weight: .semibold))
@@ -66,7 +72,7 @@ private struct TVPrimaryPillLabel: View {
                             .lineLimit(1)
                     }
                 }
-                .fixedSize(horizontal: true, vertical: false)
+                .fixedSize(horizontal: !fitsFixedWidth, vertical: false)
                 .transition(
                     stabilizesFocusMotion
                         ? .opacity
@@ -98,6 +104,9 @@ private extension View {
 struct TVSecondaryPillButton: View {
     let icon: String
     let title: String
+    /// Same opt-in as `TVPrimaryPillButton`: no scale on focus, so only the
+    /// fill changes and the row never shifts under the pill.
+    var stabilizesFocusMotion = false
     let action: () -> Void
 
     var body: some View {
@@ -112,7 +121,13 @@ struct TVSecondaryPillButton: View {
                     .fixedSize(horizontal: true, vertical: false)
             }
         }
-        .buttonStyle(TVPillButtonStyle(kind: .secondary, focusTreatment: .compact))
+        .buttonStyle(
+            TVPillButtonStyle(
+                kind: .secondary,
+                focusTreatment: .compact,
+                stabilizesFocusMotion: stabilizesFocusMotion
+            )
+        )
         .accessibilityLabel(title)
     }
 }
@@ -136,6 +151,7 @@ struct TVCircleMenuButton: View {
     /// Header shown inside the popover. Defaults to `title`.
     let menuTitle: String?
     let items: () -> [TVActionPopoverItem]
+    let onOpen: (() -> Void)?
     let onSelect: (TVActionPopoverItem) -> Void
 
     @Environment(\.isEnabled) private var isEnabled
@@ -152,6 +168,7 @@ struct TVCircleMenuButton: View {
         stabilizesFocusMotion: Bool = false,
         menuTitle: String? = nil,
         items: @escaping () -> [TVActionPopoverItem],
+        onOpen: (() -> Void)? = nil,
         onSelect: @escaping (TVActionPopoverItem) -> Void
     ) {
         self.icon = icon
@@ -160,6 +177,7 @@ struct TVCircleMenuButton: View {
         self.stabilizesFocusMotion = stabilizesFocusMotion
         self.menuTitle = menuTitle
         self.items = items
+        self.onOpen = onOpen
         self.onSelect = onSelect
     }
 
@@ -210,6 +228,7 @@ struct TVCircleMenuButton: View {
 
     private func open() {
         guard isEnabled, !isPresented else { return }
+        onOpen?()
         presentationId = UUID()
         isPresented = true
     }
@@ -385,7 +404,7 @@ private struct TVCirclePillSurface: View {
 /// Invisible, full-size focus and press host laid over `TVCirclePillSurface`.
 /// Suppresses the system focus halo (the surface paints its own) and mirrors
 /// the press state out so the surface can react to it.
-private struct TVCircleFocusHostButtonStyle: ButtonStyle {
+struct TVCircleFocusHostButtonStyle: ButtonStyle {
     let isPressed: Binding<Bool>?
 
     func makeBody(configuration: Configuration) -> some View {
@@ -423,6 +442,7 @@ enum TVDetailAction: Hashable {
     case audio
     case subtitles
     case watchlist
+    case rating
     case more
 }
 
@@ -457,7 +477,11 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
     let focusResetKey: String
     let initialFocusScope: InitialFocusScope
     let focusNamespace: Namespace.ID
-    let playFocused: FocusState<Bool>.Binding
+    let focusedAction: FocusState<TVDetailAction?>.Binding
+    /// Mirrors `entryAction` up to the page's outer `focusScope` so re-enabling
+    /// the page after a popover closes lands directly on the button that opened
+    /// it instead of flashing Play for a frame.
+    @Binding var preferredAction: TVDetailAction
     let rowFocused: FocusState<Bool>.Binding
     /// Opt-in treatment used by the redesigned Movie and Series pages. Play
     /// stays a labeled pill and no control scales on focus; secondary circles
@@ -469,6 +493,12 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
     var isPlaybackLoading = false
     var allowsInitialPlayFocus = true
     var tracksInitialFocusNavigation = false
+    /// The viewer's rating, shown as a star button between Watchlist and
+    /// More, with its hint line under the row. Nil leaves both out.
+    var rating: TVDetailRating? = nil
+    /// Mirrors "the star button is editing" out to the page, which disables
+    /// everything below the row meanwhile.
+    var isRatingEditing: Binding<Bool>? = nil
     /// Receives the row's focus binding; bind each selector to its
     /// `TVDetailAction` so the row can restore it.
     @ViewBuilder let playbackSelectors: (FocusState<TVDetailAction?>.Binding) -> PlaybackSelectors
@@ -481,7 +511,8 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
     @State private var initialPlayFocusTask: Task<Void, Never>?
     @State private var lastFocusedAction: TVDetailAction = .play
     @State private var disabledActions: Set<TVDetailAction> = []
-    @FocusState private var focusedAction: TVDetailAction?
+    @State private var ratingEditor = TVRatingEditor()
+    @Environment(\.layoutDirection) private var layoutDirection
 
     var body: some View {
         HStack(spacing: stabilizesFocusMotion ? 18 : 36) {
@@ -495,11 +526,10 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
                     subtitle: playSubtitle,
                     stabilizesFocusMotion: stabilizesFocusMotion,
                     fixedWidth: primaryButtonWidth,
-                    action: onPlay,
-                    focused: playFocused
+                    action: onPlay
                 )
-                .disabled(playTitle == nil)
-                .focused($focusedAction, equals: .play)
+                .disabled(playTitle == nil || isEditingRating)
+                .focused(focusedAction, equals: .play)
                 .onGeometryChange(for: Bool.self) { proxy in
                     proxy.size.width > 0 && proxy.size.height > 0
                 } action: { isLaidOut in
@@ -518,10 +548,12 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
                         stabilizesFocusMotion: stabilizesFocusMotion,
                         action: onStartOver
                     )
-                    .focused($focusedAction, equals: .startOver)
+                    .disabled(isEditingRating)
+                    .focused(focusedAction, equals: .startOver)
                 }
 
-                playbackSelectors($focusedAction)
+                playbackSelectors(focusedAction)
+                    .disabled(isEditingRating)
             }
 
             TVCircleActionButton(
@@ -539,28 +571,81 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
                 stabilizesFocusMotion: stabilizesFocusMotion,
                 action: onToggleWatchlist
             )
-            .focused($focusedAction, equals: .watchlist)
+            .disabled(isEditingRating)
+            .focused(focusedAction, equals: .watchlist)
+
+            if let rating {
+                // While editing, this is the only enabled control on the
+                // page, so Left, Right, Up and Down find no focus target and
+                // reach the row's move handler below.
+                TVRatingActionButton(
+                    rating: rating,
+                    editor: ratingEditor,
+                    onSelect: { selectRating(rating) },
+                    onHold: { holdRating(rating) },
+                    onCancel: { ratingEditor.cancel() },
+                    onAdjust: { ratingEditor.step($0) }
+                )
+                .focused(focusedAction, equals: .rating)
+            }
 
             moreMenu()
-                .focused($focusedAction, equals: .more)
+                .disabled(isEditingRating)
+                .focused(focusedAction, equals: .more)
         }
         .focused(rowFocused)
         .frame(maxWidth: .infinity, alignment: .leading)
+        // The hint hangs below the row without taking layout space, so the
+        // hero and everything under it stay where they are.
+        .overlay(alignment: .bottomLeading) {
+            if let rating {
+                TVRatingHintLine(hint: ratingEditor.hint(isSeries: rating.isSeries))
+                    .offset(y: TVRatingHintLine.slotHeight + Self.ratingHintSpacing)
+            }
+        }
         .focusSection()
         // Entering the row from below lands on the last focused action,
         // else Play, instead of whichever control sits above the season
         // pill or card the focus came from.
-        .defaultFocus($focusedAction, entryAction, priority: .userInitiated)
-        .onChange(of: focusedAction) { _, action in
+        .defaultFocus(focusedAction, entryAction, priority: .userInitiated)
+        .onChange(of: focusedAction.wrappedValue) { _, action in
             if let action { lastFocusedAction = action }
+            if action != .rating { ratingEditor.focusLost() }
+        }
+        .onChange(of: ratingEditor.isEditing) { _, editing in
+            isRatingEditing?.wrappedValue = editing
+        }
+        .onChange(of: rating?.score) { _, score in
+            ratingEditor.ratingChanged(to: RatingScore(server: score))
+        }
+        .task(id: ratingEditor.messageGeneration) {
+            guard ratingEditor.message != nil else { return }
+            let generation = ratingEditor.messageGeneration
+            try? await Task.sleep(for: Self.ratingMessageDuration)
+            guard !Task.isCancelled else { return }
+            ratingEditor.expireMessage(generation: generation)
+        }
+        .onChange(of: entryAction, initial: true) { _, action in
+            if preferredAction != action { preferredAction = action }
         }
         .onPreferenceChange(TVDisabledDetailActionsKey.self) { actions in
             disabledActions = actions
         }
         // Attaching the handler consumes Up at this hard top boundary of a
         // pushed detail page, keeping focus on the action row; Up must never
-        // behave like Back/Menu or pop the page to the root.
-        .onMoveCommand { _ in }
+        // behave like Back/Menu or pop the page to the root. While the star
+        // button edits, it is also where Left and Right change the draft.
+        .onMoveCommand { direction in
+            guard ratingEditor.isEditing else { return }
+            switch direction {
+            case .left: ratingEditor.step(layoutDirection == .rightToLeft ? .up : .down)
+            case .right: ratingEditor.step(layoutDirection == .rightToLeft ? .down : .up)
+            default: break
+            }
+        }
+        .onPlayPauseCommand {
+            if playTitle != nil, !ratingEditor.isEditing { onPlay() }
+        }
         .onChange(of: allowsInitialPlayFocus) { _, allowed in
             if !allowed {
                 didResetInitialPlayFocus = true
@@ -591,7 +676,46 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
         }
         .onDisappear {
             cancelInitialPlayFocusRetry()
+            ratingEditor.focusLost()
         }
+    }
+
+    private static var ratingHintSpacing: CGFloat { 12 }
+    private static var ratingMessageDuration: Duration { .seconds(3) }
+
+    private var isEditingRating: Bool { ratingEditor.isEditing }
+
+    private func selectRating(_ rating: TVDetailRating) {
+        let current = RatingScore(server: rating.score)
+        guard let write = ratingEditor.select(current: current) else {
+            if ratingEditor.message != nil { announceRatingMessage(rating) }
+            return
+        }
+        send(write, rating: rating)
+    }
+
+    private func holdRating(_ rating: TVDetailRating) {
+        guard let write = ratingEditor.hold(current: RatingScore(server: rating.score)) else { return }
+        send(write, rating: rating)
+    }
+
+    private func send(_ write: TVRatingEditor.Write, rating: TVDetailRating) {
+        switch write {
+        case .set(let score): rating.onChange(score)
+        case .remove: rating.onChange(nil)
+        }
+        announceRatingMessage(rating)
+    }
+
+    private func announceRatingMessage(_ rating: TVDetailRating) {
+        let hint: TVRatingEditor.Hint
+        switch ratingEditor.message {
+        case .saved: hint = .saved(isSeries: rating.isSeries)
+        case .removed: hint = .removed
+        case nil: return
+        }
+        let text = TVRatingHintLine.text(for: hint, locale: locale)
+        AccessibilityNotification.Announcement(text).post()
     }
 
     private var seasonKey: String? {
@@ -606,6 +730,7 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
     private var entryAction: TVDetailAction {
         var action = lastFocusedAction
         if action == .startOver, onStartOver == nil { action = .play }
+        if action == .rating, rating == nil { action = .play }
         if disabledActions.contains(action) { action = .play }
         if action == .play, playTitle == nil { return .watchlist }
         return action
@@ -622,11 +747,11 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
         }
         didResetInitialPlayFocus = true
 
-        let actionFocus = $focusedAction
+        let actionFocus = focusedAction
         initialPlayFocusTask = Task { @MainActor in
             for attempt in 0..<3 {
                 if Task.isCancelled { return }
-                if playFocused.wrappedValue { return }
+                if actionFocus.wrappedValue == .play { return }
 
                 if attempt > 0 {
                     if !tracksInitialFocusNavigation, let focusedNow = actionFocus.wrappedValue,
@@ -635,7 +760,7 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
                     }
                     try? await Task.sleep(for: .milliseconds(50))
                     if Task.isCancelled { return }
-                    if playFocused.wrappedValue { return }
+                    if actionFocus.wrappedValue == .play { return }
                     if !tracksInitialFocusNavigation, let focusedNow = actionFocus.wrappedValue,
                        focusedNow != .play {
                         return
@@ -649,7 +774,6 @@ struct TVDetailActionRow<PlaybackSelectors: View, MoreMenu: View>: View {
                     return
                 }
                 actionFocus.wrappedValue = .play
-                playFocused.wrappedValue = true
             }
         }
     }

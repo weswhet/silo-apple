@@ -94,6 +94,15 @@ final class LocaleFormatTests: XCTestCase {
         XCTAssertEqual(LocaleFormat.integer(1234, locale: japanese), "1234")
     }
 
+    /// A library's size uses the locale's thousands separator and digits.
+    func testGroupedCountsUseTheLocalesSeparator() {
+        XCTAssertEqual(LocaleFormat.groupedCount(999, locale: english), "999")
+        XCTAssertEqual(LocaleFormat.groupedCount(1284, locale: english), "1,284")
+        XCTAssertEqual(LocaleFormat.groupedCount(1_234_567, locale: english), "1,234,567")
+        XCTAssertEqual(LocaleFormat.groupedCount(1284, locale: german), "1.284")
+        XCTAssertEqual(LocaleFormat.groupedCount(1284, locale: arabic), "١٬٢٨٤")
+    }
+
     // MARK: Years and decades (D77)
 
     /// A decade chip writes its year in the format locale's digits: Arabic-
@@ -125,10 +134,10 @@ final class LocaleFormatTests: XCTestCase {
     /// language (D78), "S2021E01" included; the spoken "Season, Episode"
     /// phrase follows the locale's digits like any other number.
     func testEpisodeCodesStayLatin() {
-        assertDigits(EpisodeCardCaption.code(season: 2021, episode: 1, locale: arabic), "202101")
-        assertDigits(EpisodeCardCaption.code(season: 1, episode: 5, locale: arabic), "0105")
-        XCTAssertEqual(EpisodeCardCaption.code(season: 1, episode: 5, locale: english), "S01E05")
-        assertDigits(EpisodeCardCaption.spokenCode(season: 2021, episode: 1, locale: arabic), "٢٠٢١١")
+        assertDigits(EpisodeLabel.code(season: 2021, episode: 1, locale: arabic), "202101")
+        assertDigits(EpisodeLabel.code(season: 1, episode: 5, locale: arabic), "0105")
+        XCTAssertEqual(EpisodeLabel.code(season: 1, episode: 5, locale: english), "S01E05")
+        assertDigits(EpisodeLabel.code(season: 2021, episode: 1, style: .spoken, locale: arabic), "٢٠٢١١")
     }
 
     /// The buffer-ahead choices take their durations as counts (D79), so

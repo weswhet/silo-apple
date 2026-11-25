@@ -54,15 +54,13 @@ struct PhoneDetailPageSurface<Content: View>: View {
     /// `PhoneDetailPageLayout` needs to keep a split page clear of the iPhone
     /// Duo's status-bar column. The backdrop always fills the window.
     var keepsSideSafeArea = false
+    /// Artwork drawn here before `backdropURL`; see `AsyncImageView.fallbackUrl`.
+    var fallbackBackdropURL: String? = nil
     @ViewBuilder let content: () -> Content
 
-    @State private var sampledTint = Color(red: 0.04, green: 0.12, blue: 0.14)
-    @State private var topSafeArea: CGFloat = 0
     #if os(macOS)
     @State private var pageHeight: CGFloat = 0
     #endif
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         #if os(macOS)
@@ -79,31 +77,63 @@ struct PhoneDetailPageSurface<Content: View>: View {
             .onGeometryChange(for: CGFloat.self) { proxy in
                 proxy.size.height + proxy.safeAreaInsets.top + proxy.safeAreaInsets.bottom
             } action: { pageHeight = $0 }
-            .task(id: backdropURL) { await sampleTint() }
         #else
         ZStack {
             backdrop
                 .ignoresSafeArea()
             content()
                 .ignoresSafeArea(.all, edges: keepsSideSafeArea ? .vertical : .all)
-                .environment(\.detailPageTopSafeArea, topSafeArea)
         }
-        // Content reaches under the status bar, so it can't read this itself.
-        .onGeometryChange(for: CGFloat.self) { $0.safeAreaInsets.top } action: { topSafeArea = $0 }
-        .task(id: backdropURL) { await sampleTint() }
+        .modifier(DetailPageTopSafeAreaReader())
         #endif
     }
 
     private var backdrop: some View {
+        PhoneDetailPageBackdrop(
+            url: backdropURL,
+            thumbhash: backdropThumbhash,
+            enablesArtworkGlass: enablesArtworkGlass,
+            fallbackUrl: fallbackBackdropURL
+        )
+    }
+}
+
+/// `PhoneDetailPageSurface`'s backdrop. It keeps the sampled tint itself, so
+/// the tint arriving redraws the backdrop and not the page in front of it.
+private struct PhoneDetailPageBackdrop: View {
+    let url: String?
+    let thumbhash: String?
+    let enablesArtworkGlass: Bool
+    let fallbackUrl: String?
+
+    @State private var sampledTint: Color
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    private static let defaultTint = Color(red: 0.04, green: 0.12, blue: 0.14)
+
+    init(url: String?, thumbhash: String?, enablesArtworkGlass: Bool, fallbackUrl: String?) {
+        self.url = url
+        self.thumbhash = thumbhash
+        self.enablesArtworkGlass = enablesArtworkGlass
+        self.fallbackUrl = fallbackUrl
+        // A tint sampled on an earlier visit paints with the first frame
+        // instead of arriving after it.
+        let cached = url.flatMap(URL.init(string:)).flatMap(HeroBackdropPalette.cachedTint(for:))
+        _sampledTint = State(initialValue: cached ?? Self.defaultTint)
+    }
+
+    var body: some View {
         ZStack {
             Color.black
 
-            if usesArtworkGlass, let backdropURL, !backdropURL.isEmpty {
+            if usesArtworkGlass, let url, !url.isEmpty {
                 GeometryReader { geometry in
                     AsyncImageView(
-                        url: backdropURL,
-                        thumbhash: backdropThumbhash,
-                        contentMode: .fill
+                        url: url,
+                        thumbhash: thumbhash,
+                        contentMode: .fill,
+                        fallbackUrl: fallbackUrl
                     )
                     .frame(width: geometry.size.width, height: geometry.size.height)
                     .scaleEffect(1.18)
@@ -121,19 +151,19 @@ struct PhoneDetailPageSurface<Content: View>: View {
                 sampledTint.opacity(0.42)
             }
         }
+        .task(id: url) { await sampleTint() }
     }
 
     private func sampleTint() async {
-        guard let rawURL = backdropURL,
-              let url = URL(string: rawURL) else {
-            sampledTint = Color(red: 0.04, green: 0.12, blue: 0.14)
+        guard let url, let parsed = URL(string: url) else {
+            sampledTint = Self.defaultTint
             return
         }
 
-        if let cached = HeroBackdropPalette.cachedTint(for: url) {
+        if let cached = HeroBackdropPalette.cachedTint(for: parsed) {
             sampledTint = cached
         }
-        if let tint = await HeroBackdropPalette.tintColor(for: url),
+        if let tint = await HeroBackdropPalette.tintColor(for: parsed),
            !Task.isCancelled {
             sampledTint = tint
         }
@@ -149,6 +179,21 @@ struct PhoneDetailPageSurface<Content: View>: View {
         #endif
     }
 }
+
+#if !os(macOS)
+/// Hands the page its top safe area, which content reaching under the status
+/// bar can't read itself. Its own state, so the area settling as the detail
+/// is presented updates only the views that read it.
+private struct DetailPageTopSafeAreaReader: ViewModifier {
+    @State private var topSafeArea: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.detailPageTopSafeArea, topSafeArea)
+            .onGeometryChange(for: CGFloat.self) { $0.safeAreaInsets.top } action: { topSafeArea = $0 }
+    }
+}
+#endif
 
 /// A fixed one-device-pixel monochrome dither. At 1.4% opacity it is not meant
 /// to read as a texture; it only breaks up 8-bit colour steps in large, slowly
@@ -228,6 +273,7 @@ private struct PhoneDetailParallaxArtwork: View {
     let height: CGFloat
     let isEnabled: Bool
     var style: PhoneDetailArtworkStyle = .backdrop
+    var fallbackUrl: String? = nil
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -269,7 +315,7 @@ private struct PhoneDetailParallaxArtwork: View {
         switch style {
         case .backdrop:
             if let url, !url.isEmpty {
-                AsyncImageView(url: url, thumbhash: thumbhash, contentMode: .fill)
+                AsyncImageView(url: url, thumbhash: thumbhash, contentMode: .fill, fallbackUrl: fallbackUrl)
             } else {
                 Color.siloSurface
             }
@@ -282,7 +328,8 @@ private struct PhoneDetailParallaxArtwork: View {
                 aspectRatio: aspectRatio,
                 placeholderSymbol: placeholderSymbol,
                 coverHeight: min(max(height * 0.48, 190), 250),
-                coverTopInset: 100
+                coverTopInset: 100,
+                fallbackUrl: fallbackUrl
             )
         }
     }
@@ -371,6 +418,21 @@ enum PhoneDetailHeroLayout {
             && pageSize.width >= pageSize.height * 1.2
         #endif
     }
+
+    /// Height of the compact composition's artwork on a page `width` points
+    /// wide. `DetailPrewarmer` decodes the hero at this size ahead of a tap.
+    static func compactArtworkHeight(forWidth width: CGFloat, factor: CGFloat = 1) -> CGFloat {
+        let width = width > 0 ? width : 390
+        return min(max(width * 1.18, 430), 540) * factor
+    }
+
+    /// Height of the title logo over compact artwork `artworkHeight` tall.
+    static func compactLogoHeight(forArtworkHeight artworkHeight: CGFloat) -> CGFloat {
+        min(max(artworkHeight * 0.24, 104), 138)
+    }
+
+    /// Side inset of the title logo in the compact composition.
+    static let compactTitleInset: CGFloat = 28
 }
 
 /// Artwork-led mobile detail header used inside the bottom-presented detail
@@ -413,11 +475,19 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     /// whatever height that is. For the same pages as
     /// `compactArtworkHeightFactor`.
     var fitsRegularHeroToContent = false
+    /// Artwork a card seed drew in the hero and poster slots before this
+    /// detail's own, shown while those load. See `AsyncImageView.fallbackUrl`.
+    var fallbackArtworkUrl: String? = nil
+    var fallbackPosterUrl: String? = nil
+    /// The viewer's own rating, drawn after the external scores on their
+    /// line. Only movie and series pages that can rate pass it.
+    var personalRating: PhoneRatingSlot? = nil
     @ViewBuilder let actions: () -> Actions
     @ViewBuilder let belowOverview: () -> BelowOverview
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.detailSplitCoverSlot) private var splitCoverSlot
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.locale) private var locale
     #if os(iOS)
@@ -426,6 +496,8 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     /// Rating scores follow Dynamic Type from their 15pt default.
     @ScaledMetric(relativeTo: .subheadline) private var ratingSize: CGFloat = 15
     @State private var availableWidth: CGFloat = 0
+    /// The page's width before the hero has measured its own.
+    @Environment(\.detailPageWidthHint) private var pageWidthHint
     @State private var showFullOverview = false
     #if os(macOS)
     @Environment(\.detailPageVisibleHeight) private var macPageHeight
@@ -456,7 +528,9 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
         .onGeometryChange(for: CGFloat.self) { proxy in
             proxy.size.width
         } action: { width in
-            guard abs(width - availableWidth) > 1 else { return }
+            // A measurement matching the hint the first layout used changes
+            // nothing, so storing it would only rebuild the hero.
+            guard abs(width - layoutWidth) > 1 else { return }
             availableWidth = width
         }
         .task(id: overlayData?.advisoryAge) {
@@ -465,9 +539,14 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
         }
     }
 
+    /// The measured width, else the presenter's hint until it is measured.
+    private var layoutWidth: CGFloat {
+        availableWidth > 0 ? availableWidth : pageWidthHint
+    }
+
     private var usesExpandedLayout: Bool {
         PhoneDetailHeroLayout.usesExpandedLayout(
-            availableWidth: availableWidth,
+            availableWidth: layoutWidth,
             horizontalSizeClass: horizontalSizeClass,
             verticalSizeClass: verticalSizeClass
         )
@@ -485,7 +564,8 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                 actions()
                     .padding(.top, 2)
 
-                overviewBlock
+                // The column's width, inside the padding below.
+                overviewBlock(width: layoutWidth - 2 * SiloTheme.safePadding)
                 creditBlock(alignment: .leading)
                 belowOverview()
             }
@@ -502,7 +582,8 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                 thumbhash: resolvedArtworkThumbhash,
                 height: compactArtworkHeight,
                 isEnabled: enablesArtworkParallax,
-                style: artworkStyle
+                style: artworkStyle,
+                fallbackUrl: resolvedFallbackArtworkURL
             )
 
             LinearGradient(
@@ -513,12 +594,12 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
             .allowsHitTesting(false)
 
             titleBlock(textAlignment: .center, logoHeight: compactLogoHeight)
-                .padding(.horizontal, 28)
+                .padding(.horizontal, PhoneDetailHeroLayout.compactTitleInset)
                 .padding(statusColumnEdge, statusColumnWidth)
                 .padding(.bottom, 6)
         }
         .frame(height: compactArtworkHeight)
-        .clipped()
+        .modifier(DetailHeroTopCardClip())
         // The artwork runs under the iPhone Duo's status column; the title
         // stays centred on the page beside it.
         .padding(statusColumnEdge, -statusColumnWidth)
@@ -542,24 +623,25 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     }
 
     private var compactArtworkHeight: CGFloat {
-        let width = availableWidth > 0 ? availableWidth : 390
-        return min(max(width * 1.18, 430), 540) * compactArtworkHeightFactor
+        // The hint sizes the first layout as the measured width will, so the
+        // artwork and everything under it are not placed twice.
+        PhoneDetailHeroLayout.compactArtworkHeight(forWidth: layoutWidth, factor: compactArtworkHeightFactor)
     }
 
     private var compactLogoHeight: CGFloat {
-        min(max(compactArtworkHeight * 0.24, 104), 138)
+        PhoneDetailHeroLayout.compactLogoHeight(forArtworkHeight: compactArtworkHeight)
     }
 
     // MARK: - Split page parts
 
-    /// The sidebar of a split page: title, facts, and actions, aligned to
-    /// the leading edge of the glass panel the page draws around them.
+    /// The sidebar of a split page: title, facts, and actions, centred in
+    /// the glass panel the page draws around them, as on the iPhone.
     private var paneSidebar: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(spacing: 16) {
             // Smaller than the compact logo: the sidebar is narrow and shares
             // the display's height with the facts, actions, and selectors.
-            titleBlock(textAlignment: .leading, logoHeight: 84)
-            metadataBlock(alignment: .leading, textAlignment: .leading, isCompact: true)
+            titleBlock(textAlignment: .center, logoHeight: 84)
+            metadataBlock(alignment: .center, textAlignment: .center, isCompact: true)
             actions()
                 .padding(.top, 2)
         }
@@ -568,7 +650,7 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     /// The overview and credits, which open the content pane.
     private var paneOverview: some View {
         VStack(alignment: .leading, spacing: 10) {
-            overviewBlock
+            overviewBlock()
             creditBlock(alignment: .leading)
         }
     }
@@ -576,9 +658,28 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     /// The artwork the page spreads across the whole window, from edge to
     /// edge under the sidebar and the content pane.
     private var paneArtwork: some View {
-        artwork
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
+        Group {
+            if case .cover(let aspectRatio, let placeholderSymbol) = artworkStyle, let splitCoverSlot {
+                // A cover is the whole artwork, so it sits above the sections
+                // rather than fading under them as a backdrop does. A slot too
+                // short for a legible cover keeps only the wash.
+                let slotHeight = splitCoverSlot.upperBound - splitCoverSlot.lowerBound
+                PhoneDetailCoverArtwork(
+                    url: resolvedArtworkURL,
+                    thumbhash: resolvedArtworkThumbhash,
+                    aspectRatio: aspectRatio,
+                    placeholderSymbol: placeholderSymbol,
+                    coverHeight: slotHeight >= 80 ? slotHeight : 0,
+                    coverTopInset: splitCoverSlot.lowerBound,
+                    fallbackUrl: resolvedFallbackArtworkURL
+                )
+                .preference(key: SplitCoverAboveSectionsKey.self, value: true)
+            } else {
+                artwork
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     // MARK: - Expanded iPad layout
@@ -589,14 +690,14 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
             expandedText
                 .frame(maxWidth: .infinity, alignment: .topLeading)
                 .background(alignment: .topLeading) { expandedArtwork(fillsHeight: true) }
-                .clipped()
+                .modifier(DetailHeroTopCardClip())
         } else {
             ZStack(alignment: .topLeading) {
                 expandedArtwork(fillsHeight: false)
                 expandedText
             }
             .frame(maxWidth: .infinity, minHeight: 550, alignment: .topLeading)
-            .clipped()
+            .modifier(DetailHeroTopCardClip())
         }
     }
 
@@ -613,7 +714,7 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                 .frame(maxWidth: 430, alignment: .leading)
 
             metadataBlock(alignment: .leading, textAlignment: .leading, isCompact: false)
-            overviewBlock
+            overviewBlock()
             creditBlock(alignment: .leading)
             belowOverview()
 
@@ -672,11 +773,11 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     }
 
     private var expandedEditorialWidth: CGFloat {
-        min(max(availableWidth * 0.47, 410), 560)
+        min(max(layoutWidth * 0.47, 410), 560)
     }
 
     private var expandedHorizontalPadding: CGFloat {
-        availableWidth >= 1_000 ? 56 : 40
+        layoutWidth >= 1_000 ? 56 : 40
     }
 
     #if os(macOS)
@@ -733,7 +834,7 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
 
                 macTitle
                 metadataBlock(alignment: .leading, textAlignment: .leading, isCompact: false)
-                overviewBlock
+                overviewBlock()
                 creditBlock(alignment: .leading)
                 belowOverview()
                 actions()
@@ -766,7 +867,7 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                 let detailsStart = min(max(detailsTop / max(proxy.size.height, 1), 0), 0.8)
                 // Where the details column ends across, as a fraction of the width.
                 let detailsEnd = min(macDetailsTrailingEdge / max(proxy.size.width, 1), 1)
-                AsyncImageView(url: url, thumbhash: backdropThumbhash, contentMode: .fill)
+                AsyncImageView(url: url, thumbhash: backdropThumbhash, contentMode: .fill, fallbackUrl: fallbackArtworkUrl)
                     .frame(width: proxy.size.width, height: proxy.size.height)
                     .visualEffect { content, proxy in
                         let minY = proxy.frame(in: .named(PhoneDetailScrollCoordinateSpace.name)).minY
@@ -849,7 +950,8 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                 targetSize: size,
                 contentMode: .fill,
                 placeholderStyle: .artwork,
-                placeholderSymbol: artworkStyle.placeholderSymbol
+                placeholderSymbol: artworkStyle.placeholderSymbol,
+                fallbackUrl: fallbackPosterUrl
             )
             .frame(width: size.width, height: size.height)
             .clipShape(RoundedRectangle(cornerRadius: SiloTheme.cardCornerRadius, style: .continuous))
@@ -890,7 +992,8 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                 AsyncImageView(
                     url: url,
                     thumbhash: resolvedArtworkThumbhash,
-                    contentMode: .fill
+                    contentMode: .fill,
+                    fallbackUrl: fallbackArtworkUrl
                 )
             } else {
                 Color.siloSurface
@@ -903,7 +1006,8 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                     aspectRatio: aspectRatio,
                     placeholderSymbol: placeholderSymbol,
                     coverHeight: geometry.size.height * 0.68,
-                    coverTopInset: nil
+                    coverTopInset: nil,
+                    fallbackUrl: resolvedFallbackArtworkURL
                 )
             }
         }
@@ -914,6 +1018,12 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     private var resolvedArtworkURL: String? {
         if case .cover = artworkStyle { return nonEmpty(posterUrl) }
         return nonEmpty(backdropUrl) ?? nonEmpty(posterUrl)
+    }
+
+    /// The card seed's artwork for the slot `resolvedArtworkURL` fills.
+    private var resolvedFallbackArtworkURL: String? {
+        if case .cover = artworkStyle { return fallbackPosterUrl }
+        return fallbackArtworkUrl
     }
 
     private var resolvedArtworkThumbhash: String? {
@@ -959,8 +1069,10 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
     ) -> some View {
         let stackAlignment: HorizontalAlignment = textAlignment == .leading ? .leading : .center
         let hasFacts = !metadataTokens.isEmpty || !ratingChips.isEmpty
-        if hasFacts || !ratings.isEmpty {
-            VStack(alignment: stackAlignment, spacing: 10) {
+        if hasFacts || !ratings.isEmpty || personalRating != nil {
+            // The rating line is a 44pt slot with its content centred; the
+            // design sets it 4pt under the facts.
+            VStack(alignment: stackAlignment, spacing: personalRating == nil ? 10 : 4) {
                 if hasFacts {
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 8) {
@@ -976,7 +1088,15 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
                         .frame(maxWidth: .infinity, alignment: alignment)
                     }
                 }
-                if !ratings.isEmpty {
+                if let personalRating {
+                    PhoneRatingLine(
+                        ratings: ratings,
+                        ratingSize: ratingSize,
+                        ratingLimit: isCompact ? DisplayRating.phoneLimit : .max,
+                        alignment: alignment,
+                        slot: personalRating
+                    )
+                } else if !ratings.isEmpty {
                     Group {
                         if isCompact {
                             PhoneRatingsRow(ratings: ratings, size: ratingSize)
@@ -1044,10 +1164,12 @@ struct PhoneDetailHero<Actions: View, BelowOverview: View>: View {
 
     // MARK: - Editorial copy
 
+    /// `width` is the overview's width when known before layout; see
+    /// `PhoneDetailOverview.init`.
     @ViewBuilder
-    private var overviewBlock: some View {
+    private func overviewBlock(width: CGFloat = 0) -> some View {
         if let overview, !overview.isEmpty {
-            PhoneDetailOverview(text: overview, isExpanded: $showFullOverview)
+            PhoneDetailOverview(text: overview, isExpanded: $showFullOverview, width: width)
         }
     }
 
@@ -1079,9 +1201,27 @@ private struct PhoneDetailOverview: View {
     private static let pillGap: CGFloat = 4
 
     @ScaledMetric(relativeTo: .subheadline) private var fadeWidth: CGFloat = 32
-    @State private var collapsedHeight: CGFloat = 0
-    @State private var fullHeight: CGFloat = 0
-    @State private var pillWidth: CGFloat = 0
+    @State private var collapsedHeight: CGFloat
+    @State private var fullHeight: CGFloat
+    @State private var pillWidth: CGFloat
+
+    /// `width` is the width the overview will be laid out at, when known
+    /// before layout. The sizes are then estimated from it, so the first
+    /// layout already places the MORE pill and the fade; the measurements
+    /// below only correct an estimate that is off. Zero measures as before.
+    init(text: String, isExpanded: Binding<Bool>, width: CGFloat = 0) {
+        self.text = text
+        _isExpanded = isExpanded
+        let estimate = OverviewMetrics.estimate(
+            text: text,
+            width: width,
+            lineLimit: Self.collapsedLineLimit,
+            lineSpacing: Self.lineSpacing
+        )
+        _collapsedHeight = State(initialValue: estimate?.collapsedHeight ?? 0)
+        _fullHeight = State(initialValue: estimate?.fullHeight ?? 0)
+        _pillWidth = State(initialValue: estimate?.pillWidth ?? 0)
+    }
 
     var body: some View {
         styledText
@@ -1090,7 +1230,7 @@ private struct PhoneDetailOverview: View {
             .onGeometryChange(for: CGFloat.self) { proxy in
                 proxy.size.height
             } action: { height in
-                collapsedHeight = height
+                if abs(height - collapsedHeight) > 0.5 { collapsedHeight = height }
             }
             .background {
                 styledText
@@ -1099,7 +1239,7 @@ private struct PhoneDetailOverview: View {
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.size.height
                     } action: { height in
-                        fullHeight = height
+                        if abs(height - fullHeight) > 0.5 { fullHeight = height }
                     }
                     .hidden()
             }
@@ -1110,7 +1250,7 @@ private struct PhoneDetailOverview: View {
                         .onGeometryChange(for: CGFloat.self) { proxy in
                             proxy.size.width
                         } action: { width in
-                            pillWidth = width
+                            if abs(width - pillWidth) > 0.5 { pillWidth = width }
                         }
                         .frame(height: lastLineHeight)
                 }
@@ -1180,6 +1320,79 @@ private struct PhoneDetailOverview: View {
     }
 }
 
+/// Estimates `PhoneDetailOverview`'s sizes before it is laid out, by setting
+/// its text the way SwiftUI does.
+@MainActor
+private enum OverviewMetrics {
+    struct Sizes {
+        let collapsedHeight: CGFloat
+        let fullHeight: CGFloat
+        let pillWidth: CGFloat
+    }
+
+    /// Body evaluations re-create the overview; each text and width is set once.
+    private static var cache: [String: Sizes] = [:]
+
+    static func estimate(text: String, width: CGFloat, lineLimit: Int, lineSpacing: CGFloat) -> Sizes? {
+        #if os(iOS)
+        guard width > 0, !text.isEmpty else { return nil }
+        let category = UIApplication.shared.preferredContentSizeCategory
+        let traits = UITraitCollection(preferredContentSizeCategory: category)
+        let bodySize = UIFontMetrics(forTextStyle: .subheadline).scaledValue(for: 15, compatibleWith: traits)
+        let pillSize = UIFontMetrics(forTextStyle: .caption2).scaledValue(for: 10, compatibleWith: traits)
+        let pillLabel = AppLanguage.string(.detailOverviewMore)
+        let key = "\(width)|\(bodySize)|\(pillSize)|\(pillLabel)|\(text)"
+        if let cached = cache[key] { return cached }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        let body = NSAttributedString(string: text, attributes: [
+            .font: UIFont.systemFont(ofSize: bodySize),
+            .paragraphStyle: paragraph,
+        ])
+        let pill = NSAttributedString(string: pillLabel, attributes: [
+            .font: UIFont.systemFont(ofSize: pillSize, weight: .heavy),
+            .kern: 0.6,
+        ])
+        let scale = UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.screen.scale }.first ?? 3
+        func pixels(_ value: CGFloat) -> CGFloat { (value * scale).rounded(.up) / scale }
+
+        let full = height(of: body, width: width, lineLimit: 0)
+        var collapsed = height(of: body, width: width, lineLimit: lineLimit)
+        // Cut short, the text keeps the spacing after its last line, which
+        // SwiftUI leaves out.
+        if full > collapsed + 1 { collapsed -= lineSpacing }
+        let sizes = Sizes(
+            collapsedHeight: pixels(collapsed),
+            fullHeight: pixels(full),
+            pillWidth: pixels(pill.size().width) + 16
+        )
+        if cache.count > 64 { cache.removeAll() }
+        cache[key] = sizes
+        return sizes
+        #else
+        return nil
+        #endif
+    }
+
+    #if os(iOS)
+    /// The height of `text` set at `width` in at most `lineLimit` lines
+    /// (zero for no limit).
+    private static func height(of text: NSAttributedString, width: CGFloat, lineLimit: Int) -> CGFloat {
+        let storage = NSTextStorage(attributedString: text)
+        let layout = NSLayoutManager()
+        let container = NSTextContainer(size: CGSize(width: width, height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        container.maximumNumberOfLines = lineLimit
+        layout.addTextContainer(container)
+        storage.addLayoutManager(layout)
+        layout.ensureLayout(for: container)
+        return layout.usedRect(for: container).height
+    }
+    #endif
+}
+
 // MARK: - Cover artwork
 
 /// Fills the artwork slot with a soft, saturated wash of the cover, then
@@ -1192,12 +1405,17 @@ private struct PhoneDetailCoverArtwork: View {
     let placeholderSymbol: String
     let coverHeight: CGFloat
     let coverTopInset: CGFloat?
+    /// See `AsyncImageView.fallbackUrl`.
+    var fallbackUrl: String? = nil
 
     var body: some View {
         ZStack(alignment: coverTopInset == nil ? .center : .top) {
             wash
-            cover
-                .padding(.top, coverTopInset ?? 0)
+            // Zero draws the wash alone.
+            if coverHeight > 0 {
+                cover
+                    .padding(.top, coverTopInset ?? 0)
+            }
         }
     }
 
@@ -1210,7 +1428,8 @@ private struct PhoneDetailCoverArtwork: View {
                         url: url,
                         thumbhash: thumbhash,
                         targetSize: CGSize(width: 420, height: 420),
-                        contentMode: .fill
+                        contentMode: .fill,
+                        fallbackUrl: fallbackUrl
                     )
                     .scaleEffect(1.25)
                     .saturation(1.2)
@@ -1231,7 +1450,8 @@ private struct PhoneDetailCoverArtwork: View {
             targetSize: CGSize(width: width, height: coverHeight),
             contentMode: .fill,
             placeholderStyle: .artwork,
-            placeholderSymbol: placeholderSymbol
+            placeholderSymbol: placeholderSymbol,
+            fallbackUrl: fallbackUrl
         )
         .frame(width: width, height: coverHeight)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -1272,6 +1492,41 @@ private struct PhoneHeroTitle: View {
         // The title sits over fixed-height artwork with a two-line limit;
         // past AX1 a long title would truncate rather than read better.
         .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+    }
+}
+
+/// Rounds the top corners of the detail hero artwork to match the display or
+/// sheet card, so pulling down past the top of the scroll view reveals a
+/// rounded card edge instead of a square cut.
+private struct DetailHeroTopCardClip: ViewModifier {
+    #if os(iOS)
+    @Environment(\.detailPageTopSafeArea) private var topSafeArea
+    #endif
+
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        if #available(iOS 26.0, *) {
+            content.clipShape(
+                ConcentricRectangle(
+                    uniformTopCorners: .concentric(minimum: .fixed(32)),
+                    uniformBottomCorners: .fixed(0)
+                )
+            )
+        } else {
+            let radius: CGFloat = topSafeArea >= 44 ? 44 : 24
+            content.clipShape(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: radius,
+                    bottomLeadingRadius: 0,
+                    bottomTrailingRadius: 0,
+                    topTrailingRadius: radius,
+                    style: .continuous
+                )
+            )
+        }
+        #else
+        content.clipped()
+        #endif
     }
 }
 

@@ -268,6 +268,8 @@ struct CatalogGridCard: View {
                 playAction: playAction,
                 contentId: item.contentId,
                 seriesContext: SeriesDetailContext(item: SectionItem(browseItem: item)),
+                collectionTargetTitle: item.isEpisodeItem ? item.seriesTitle : item.title,
+                detailSeedSource: .browse(item),
                 aspect: item.isAudiobook ? .square : .poster,
                 cardWidthOverride: widthOverride,
                 episodeAccessibilityLabel: EpisodeCardCaption.accessibilityLabel(for: item, locale: locale),

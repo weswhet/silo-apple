@@ -170,7 +170,8 @@ struct OfflineSeriesBrowseView: View {
            let match = group.seasons.first(where: { $0.seasonNumber == selectedSeasonNumber }) {
             return match
         }
-        return group.seasons.first
+        // Specials list first, but open on the first numbered season.
+        return group.seasons.first { !$0.isSpecials } ?? group.seasons.first
     }
 
     private func heroEyebrow(_ group: DownloadSeriesGroup) -> String {
@@ -198,24 +199,29 @@ struct OfflineSeriesBrowseView: View {
     }
 
     private func episodeTag(_ record: DownloadRecord) -> String? {
-        guard let episode = record.episodeNumber.map({ LocaleFormat.codeNumber($0) }) else { return nil }
-        if let season = record.seasonNumber, season > 0 {
-            return AppLanguage.string(.detailEpisodeCode(LocaleFormat.codeNumber(season), episode), locale: locale)
+        guard let episode = record.episodeNumber else { return nil }
+        if let date = EpisodeLabel.airDate(labels: record.episodeLabels, airDate: record.airDate, locale: locale) {
+            return date
         }
-        return AppLanguage.string(.calendarEpisodeShort(episode), locale: locale)
+        if let season = record.seasonNumber, season > 0 {
+            return EpisodeLabel.code(season: season, episode: episode, style: .dotted, locale: locale)
+        }
+        return AppLanguage.string(.calendarEpisodeShort(LocaleFormat.codeNumber(episode)), locale: locale)
     }
 }
 
-// MARK: - Leaf detail (movie or episode)
+// MARK: - Leaf detail (movie, episode or audiobook)
 
-/// Offline leaf detail for one downloaded movie or episode, built from the
-/// same hero as the online detail page: the downloaded backdrop (or poster)
-/// and title logo, metadata, Play/Resume, then what this download contains
-/// and a confirmed delete. Everything comes from the download bundle on disk.
+/// Offline leaf detail for one downloaded movie, episode or audiobook, built
+/// from the same hero as the online detail page: the downloaded backdrop (or
+/// poster) and title logo, metadata, Play/Resume, then what this download
+/// contains and a confirmed delete. Everything comes from the download bundle
+/// on disk. A book plays in the audio player.
 struct OfflineDownloadDetailView: View {
     let downloadId: String
 
     @Environment(AppRouter.self) private var router
+    @Environment(AudioPlaybackStore.self) private var audioStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.locale) private var locale
     private var manager: DownloadManager { DownloadManager.shared }
@@ -298,6 +304,11 @@ struct OfflineDownloadDetailView: View {
             factsLine: factsLine(record),
             overlayData: nil,
             enablesArtworkParallax: true,
+            // A book without a backdrop shows its cover, as its online page does.
+            artworkStyle: record.isAudiobook && backdrop == nil
+                ? .cover(aspectRatio: BookDetailKind.audiobook.coverAspectRatio,
+                         placeholderSymbol: BookDetailKind.audiobook.placeholderSymbol)
+                : .backdrop,
             actions: { actions(record) },
             belowOverview: { EmptyView() }
         )
@@ -308,7 +319,7 @@ struct OfflineDownloadDetailView: View {
             PhonePrimaryPillButton(
                 icon: "play.fill",
                 title: playLabel(record),
-                action: { router.playOffline(record) },
+                action: { play(record) },
                 fullWidth: true,
                 progress: resumeFraction(record)
             )
@@ -316,7 +327,7 @@ struct OfflineDownloadDetailView: View {
             PhoneLabeledActionRow {
                 if resumeFraction(record) != nil {
                     PhoneLabeledAction(icon: "gobackward", label: AppLanguage.string(.detailStartOver, locale: locale), isToggle: false) {
-                        router.playOffline(record, fromStart: true)
+                        play(record, fromStart: true)
                     }
                 }
                 PhoneLabeledAction(icon: "trash", label: AppLanguage.string(.downloadsOfflineDetailDelete, locale: locale), isToggle: false) {
@@ -325,6 +336,25 @@ struct OfflineDownloadDetailView: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// Plays the download: a book in the audio player, which opens its local
+    /// file (and works offline), anything else in the offline video player.
+    private func play(_ record: DownloadRecord, fromStart: Bool = false) {
+        guard record.isAudiobook else {
+            router.playOffline(record, fromStart: fromStart)
+            return
+        }
+        audioStore.play(
+            contentId: record.contentId,
+            restart: fromStart,
+            preview: AudioPlaybackPreview(
+                contentId: record.contentId,
+                title: record.displayTitle(locale: locale),
+                subtitle: record.subtitle,
+                posterUrl: manager.posterImageURL(for: record)?.absoluteString
+            )
+        )
     }
 
     /// What this copy on the device contains, in the online page's
@@ -340,7 +370,7 @@ struct OfflineDownloadDetailView: View {
                             .frame(height: 1)
                     }
                     HStack(alignment: .top, spacing: 16) {
-                        Text(row.0.uppercased())
+                        Text(row.0.uppercased(with: locale))
                             .font(.system(size: 11, weight: .bold))
                             .tracking(1.2)
                             .foregroundColor(.siloOnSurface.opacity(0.5))
@@ -370,13 +400,26 @@ struct OfflineDownloadDetailView: View {
                 tokens.append(.text(series))
             }
         }
+        // A book's subtitle is its author, or its year when the row was
+        // imported without one; the year has its own token.
+        if record.isAudiobook, let author = record.subtitle, !author.isEmpty,
+           author != manifest?.year.map(String.init) {
+            tokens.append(.text(author))
+        }
         if let year = manifest?.year, year > 0 { tokens.append(.text(LocaleFormat.integer(year, locale: locale))) }
-        if let runtime = MediaTextFormatting.runtime(minutes: manifest?.runtime) {
+        if let runtime = MediaTextFormatting.runtime(minutes: runtimeMinutes(record)) {
             tokens.append(.text(runtime))
         }
         if let resolution = MediaTextFormatting.resolution(manifest?.resolution) { tokens.append(.text(resolution)) }
         if manifest?.hdr == true { tokens.append(.text("HDR")) }
         return tokens
+    }
+
+    /// The catalog runtime, or a book's length from its file.
+    private func runtimeMinutes(_ record: DownloadRecord) -> Int? {
+        if let runtime = manifest?.runtime { return runtime }
+        guard record.isAudiobook, let seconds = manifest?.durationSeconds, seconds.isFinite, seconds > 0 else { return nil }
+        return Int((seconds / 60).rounded())
     }
 
     private func sourceTokens(_ record: DownloadRecord) -> [String] {
@@ -432,8 +475,11 @@ struct OfflineDownloadDetailView: View {
     }
 
     private func playLabel(_ record: DownloadRecord) -> String {
+        // Within 5 s of the end a book starts over, so it isn't offered as a resume.
         guard let progress = manager.localProgress(forMediaItemId: record.leafMediaItemId),
-              progress.position > 30 else { return AppLanguage.string(.commonPlay, locale: locale) }
+              progress.position > 30,
+              !record.isAudiobook || AudiobookProgress.playerStartPosition(progress.position, totalDuration: progress.duration) > 0
+        else { return AppLanguage.string(.commonPlay, locale: locale) }
         return AppLanguage.string(.downloadsOfflinePlayResumeAt(PlayerTimeFormatter.formatHMS(progress.position)), locale: locale)
     }
 
