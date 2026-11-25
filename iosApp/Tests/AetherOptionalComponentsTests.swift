@@ -3,20 +3,26 @@ import XCTest
 import AetherEngine
 
 /// Silo's AetherEngine fork sets which optional engine components are compiled in.
-/// Upstream says each may need third-party patent licenses, so Silo ships none of
-/// them. A pin bump or fork change must not turn one on by accident.
+/// This personal fork turns on the two object-audio components so TrueHD Atmos and
+/// DTS:X keep their heights; the Dolby Vision components stay off.
 final class AetherOptionalComponentsTests: XCTestCase {
 
-    func testNoOptionalComponentIsBuiltIn() {
+    private static let enabled: Set<String> = ["TrueHDObjectAudio", "DTSXObjectAudio"]
+
+    func testOnlyObjectAudioComponentsAreBuiltIn() {
         for component in AetherEngine.OptionalComponent.allCases {
-            XCTAssertFalse(component.isBuiltIn, "\(component.traitName) is built in")
+            XCTAssertEqual(
+                component.isBuiltIn,
+                Self.enabled.contains(component.traitName),
+                "\(component.traitName) built-in state"
+            )
         }
     }
 
-    /// The TrueHD Atmos and DTS:X setting is hidden, and a stored "on" from an
-    /// earlier build asks the engine for nothing.
-    func testObjectAudioSettingNeverRequestsRendering() {
-        XCTAssertFalse(AetherObjectAudioPolicy.isAvailable)
-        XCTAssertEqual(AetherObjectAudioPolicy.rendering(enabled: true), .off)
+    /// The TrueHD Atmos and DTS:X setting is shown and asks for APAC when on.
+    func testObjectAudioSettingRequestsRenderingWhenOn() {
+        XCTAssertTrue(AetherObjectAudioPolicy.isAvailable)
+        XCTAssertEqual(AetherObjectAudioPolicy.rendering(enabled: true), .apac(AetherObjectAudioPolicy.layout))
+        XCTAssertEqual(AetherObjectAudioPolicy.rendering(enabled: false), .off)
     }
 }
