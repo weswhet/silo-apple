@@ -70,6 +70,8 @@ extension APIv2Client {
                                        auth: CapturedOrdinaryRequestAuth) async throws -> Value {
         let path = try id.map { "/api/v2/playlists/\(try catalogPathSegment($0))" } ?? "/api/v2/playlists"
         let raw = try await collectionRequest("GET", path: path + suffix, query: query, status: 200, auth: auth)
-        return try HTTPClient.makeJSONDecoder().decode(type, from: raw.data)
+        // Artwork paths are server-relative; the decoder resolves them against
+        // the answering server, as the other collection reads do.
+        return try HTTPClient.makeJSONDecoder(artworkServerURL: raw.url).decode(type, from: raw.data)
     }
 }
