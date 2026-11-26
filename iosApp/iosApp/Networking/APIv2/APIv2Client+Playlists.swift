@@ -18,9 +18,10 @@ struct PlaylistEntry: Decodable, Identifiable, Sendable {
     let available: Bool
 }
 
-struct PlaylistItem: Decodable, Sendable {
-    let title: String
-}
+/// A playlist entry's catalog card has the same fields as a shuffle pick: the
+/// grid shows its still and title, and the player announces the next entry
+/// on the Up Next screen with it.
+typealias PlaylistItem = ShuffleItem
 
 struct PlaylistCapability: Decodable {
     let available: Bool

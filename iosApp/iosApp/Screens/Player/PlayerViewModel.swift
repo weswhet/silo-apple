@@ -3737,7 +3737,6 @@ class PlayerViewModel {
     }
 
     private func loadNextUpCandidate(for detail: WatchDetail) {
-        guard playlistContext == nil else { return }
         guard !isWatchPartyPlayback else { return }
         nextUpLookupTask?.cancel()
         nextUpLookupTask = nil
@@ -3747,6 +3746,12 @@ class PlayerViewModel {
         nextUpAutoplayCancelled = false
         nextUpPromptDismissed = false
         cancelNextUpCountdown()
+
+        // A playlist replaces the series order: its next entry follows.
+        if playlistContext != nil {
+            loadPlaylistNextUp()
+            return
+        }
 
         // A shuffle replaces the series order: the server picks what follows.
         if shuffleState != nil {
@@ -4370,6 +4375,44 @@ class PlayerViewModel {
             finalizeCurrentSession: true,
             origin: .autoplay
         )
+    }
+
+    /// Announces the playlist's next entry on the Up Next screen, the way a
+    /// series announces its next episode. Play Now and the countdown still go
+    /// through `advancePlaylist`, which resolves the entry again before it
+    /// loads, so an entry that became unavailable is skipped there.
+    private func loadPlaylistNextUp() {
+        guard let context = playlistContext else { return }
+        isLoadingNextUpEpisode = true
+        nextUpLookupTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            defer {
+                if !Task.isCancelled {
+                    self.nextUpLookupTask = nil
+                }
+            }
+            do {
+                let entry = try await SiloAPI.shared.resolvePlaylist(context, after: true)
+                guard !Task.isCancelled, !self.isDisposed,
+                      self.playlistContext?.entryId == context.entryId else { return }
+                self.nextUpEpisode = entry?.item.map(PlayerNextUpEpisode.init(shufflePick:))
+                self.isLoadingNextUpEpisode = false
+                self.nextUpLookupError = nil
+                if self.showNextUpScreen {
+                    self.startNextUpCountdownIfNeeded()
+                } else {
+                    self.updateNextUpPresentation(for: self.currentTime)
+                }
+            } catch {
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                self.isLoadingNextUpEpisode = false
+                self.nextUpLookupError = (error as? LocalizedError)?.errorDescription
+                    ?? String(describing: error)
+                if self.showNextUpScreen {
+                    self.cancelNextUpCountdown()
+                }
+            }
+        }
     }
 
     /// Resolve immediately before each load. Entry IDs, not content IDs, keep
@@ -5988,8 +6031,14 @@ class PlayerViewModel {
                 playQueuePart(part)
                 return
             case .playlistEntry:
-                advancePlaylist(unattended: true)
-                return
+                // With the next entry announced, end like a series episode:
+                // Up Next and its countdown, which then advance the playlist.
+                // Without one (still loading, failed, or the playlist ends),
+                // advance now; that resolves and shows the finished state.
+                if nextUpEpisode == nil {
+                    advancePlaylist(unattended: true)
+                    return
+                }
             case .postroll:
                 break
             }
